@@ -1,5 +1,5 @@
 ---
-- name: Ubuntu 20.04 → 22.04 → 24.04 (STRICT GATED UPGRADE)
+- name: Ubuntu 20.04 → 22.04 → 24.04 (AWX Safe & Gated)
   hosts: all
   become: true
   gather_facts: true
@@ -17,7 +17,7 @@
         enabled: false
       ignore_errors: true
 
-    - name: Disable third-party repositories
+    - name: Disable all third-party apt repositories (temporary)
       shell: |
         mkdir -p /root/apt-backup
         if [ -d /etc/apt/sources.list.d ]; then
@@ -32,7 +32,10 @@
     - name: Fix broken packages
       command: apt-get -f install -y
 
-    - name: Remove held packages
+    - name: Configure any unpacked packages
+      command: dpkg --configure -a
+
+    - name: Remove held packages (if any)
       shell: |
         HELD=$(apt-mark showhold || true)
         if [ -n "$HELD" ]; then
@@ -41,7 +44,7 @@
       args:
         executable: /bin/bash
 
-    - name: Perform mandatory dist-upgrade
+    - name: Mandatory full dist-upgrade
       command: apt-get dist-upgrade -y
 
     - name: Check if reboot is required
@@ -55,22 +58,26 @@
       when: reboot_required.stat.exists
 
     ####################################################################
-    # PHASE 2 — ABSOLUTE HARD GATE (THIS IS THE KEY)
+    # PHASE 2 — HARD GATE (UBUNTU DECIDES)
     ####################################################################
 
-    - name: Check release upgrade eligibility (Ubuntu gate)
+    - name: Check Ubuntu release upgrade readiness
       command: do-release-upgrade -c
       register: release_check
       changed_when: false
 
-    - name: STOP if Ubuntu blocks the upgrade
+    - name: Stop if Ubuntu is not ready for upgrade
       fail:
         msg: |
-          ❌ Ubuntu refused the release upgrade.
-          This is NOT an AWX or Ansible issue.
-          You MUST fix the OS state first.
+          ❌ Ubuntu is NOT ready for a release upgrade.
+          Automation is intentionally stopped.
 
-          Output from Ubuntu:
+          You must fix this on the host first:
+            sudo apt full-upgrade -y
+            sudo reboot
+            sudo do-release-upgrade -c
+
+          Ubuntu output:
           {{ release_check.stdout }}
       when: "'New release' not in release_check.stdout"
 
@@ -90,7 +97,7 @@
         line: 'Prompt=lts'
 
     ####################################################################
-    # PHASE 4 — UPGRADE (WILL ONLY RUN IF GATE PASSES)
+    # PHASE 4 — UPGRADE (ONLY RUNS IF GATE PASSES)
     ####################################################################
 
     - name: Upgrade Ubuntu 20.04 → 22.04
