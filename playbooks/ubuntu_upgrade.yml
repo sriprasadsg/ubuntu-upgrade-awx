@@ -1,58 +1,119 @@
 ---
-- name: Ubuntu 20.04 → 22.04 → 24.04 upgrade (AWX-safe)
+- name: Ubuntu 20.04 → 22.04 → 24.04 Upgrade (AWX-safe)
   hosts: all
   become: true
-  gather_facts: false
+  gather_facts: true
   serial: 1
 
   tasks:
-    - name: Stop unattended upgrades
-      shell: systemctl stop unattended-upgrades || true
 
-    - name: Disable third-party repositories
+    ####################################################################
+    # HARD STOP: CLEAN SYSTEM FIRST (NO EXCEPTIONS)
+    ####################################################################
+
+    - name: Stop unattended upgrades
+      systemd:
+        name: unattended-upgrades
+        state: stopped
+        enabled: false
+      ignore_errors: true
+
+    - name: Disable all third-party repositories
       shell: |
         mkdir -p /root/apt-backup
-        mv /etc/apt/sources.list.d/* /root/apt-backup/ 2>/dev/null || true
+        if [ -d /etc/apt/sources.list.d ]; then
+          mv /etc/apt/sources.list.d/* /root/apt-backup/ 2>/dev/null || true
+        fi
+      args:
+        executable: /bin/bash
 
     - name: Update apt cache
-      shell: apt update
+      command: apt-get update
 
     - name: Fix broken packages
-      shell: apt --fix-broken install -y
+      command: apt-get -f install -y
 
     - name: Remove held packages
       shell: |
-        apt-mark showhold | xargs -r apt-mark unhold
+        HELD=$(apt-mark showhold || true)
+        if [ -n "$HELD" ]; then
+          apt-mark unhold $HELD
+        fi
+      args:
+        executable: /bin/bash
 
-    - name: Full dist-upgrade (MANDATORY)
-      shell: apt full-upgrade -y
+    - name: FORCE full dist-upgrade (Ubuntu requirement)
+      command: apt-get dist-upgrade -y
 
     - name: Check if reboot is required
-      shell: |
-        if [ -f /var/run/reboot-required ]; then echo reboot; fi
-      register: reboot_check
-      changed_when: false
+      stat:
+        path: /var/run/reboot-required
+      register: reboot_required
 
-    - name: Reboot before release upgrade
+    - name: Reboot if required
       reboot:
         reboot_timeout: 1800
-      when: "'reboot' in reboot_check.stdout"
+      when: reboot_required.stat.exists
 
-    - name: Verify release upgrade availability
-      shell: do-release-upgrade -c
+    ####################################################################
+    # HARD GATE: VERIFY UBUNTU ALLOWS UPGRADE
+    ####################################################################
+
+    - name: Verify Ubuntu allows release upgrade
+      command: do-release-upgrade -c
       register: release_check
       changed_when: false
 
-    - name: Fail if Ubuntu still blocks upgrade
+    - name: Abort if Ubuntu blocks upgrade
       fail:
         msg: |
-          Ubuntu is blocking the release upgrade.
+          Ubuntu is blocking the upgrade.
+          This is NOT an AWX issue.
           Output:
           {{ release_check.stdout }}
       when: "'available' not in release_check.stdout"
 
-    - name: Run release upgrade 20.04 → 22.04
-      shell: do-release-upgrade -f DistUpgradeViewNonInteractive
+    ####################################################################
+    # CONFIGURE RELEASE UPGRADER
+    ####################################################################
+
+    - name: Ensure update-manager-core is installed
+      apt:
+        name: update-manager-core
+        state: present
+
+    - name: Ensure LTS upgrades are enabled
+      lineinfile:
+        path: /etc/update-manager/release-upgrades
+        regexp: '^Prompt='
+        line: 'Prompt=lts'
+
+    ####################################################################
+    # 20.04 → 22.04
+    ####################################################################
+
+    - name: Upgrade Ubuntu 20.04 → 22.04
+      command: do-release-upgrade -f DistUpgradeViewNonInteractive
+      when: ansible_distribution_version == "20.04"
       async: 14400
       poll: 30
+
+    - name: Reboot after 22.04 upgrade
+      reboot:
+        reboot_timeout: 1800
+      when: ansible_distribution_version == "22.04"
+
+    ####################################################################
+    # 22.04 → 24.04
+    ####################################################################
+
+    - name: Upgrade Ubuntu 22.04 → 24.04
+      command: do-release-upgrade -f DistUpgradeViewNonInteractive
+      when: ansible_distribution_version == "22.04"
+      async: 14400
+      poll: 30
+
+    - name: Final reboot
+      reboot:
+        reboot_timeout: 1800
 
