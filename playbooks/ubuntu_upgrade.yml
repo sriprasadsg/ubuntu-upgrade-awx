@@ -1,14 +1,13 @@
 ---
-- name: Ubuntu 20.04 → 22.04 → 24.04 Upgrade (AWX-safe)
+- name: Ubuntu 20.04 → 22.04 → 24.04 (STRICT GATED UPGRADE)
   hosts: all
   become: true
   gather_facts: true
   serial: 1
 
   tasks:
-
     ####################################################################
-    # HARD STOP: CLEAN SYSTEM FIRST (NO EXCEPTIONS)
+    # PHASE 1 — FORCE SYSTEM INTO A CLEAN STATE
     ####################################################################
 
     - name: Stop unattended upgrades
@@ -18,7 +17,7 @@
         enabled: false
       ignore_errors: true
 
-    - name: Disable all third-party repositories
+    - name: Disable third-party repositories
       shell: |
         mkdir -p /root/apt-backup
         if [ -d /etc/apt/sources.list.d ]; then
@@ -42,7 +41,7 @@
       args:
         executable: /bin/bash
 
-    - name: FORCE full dist-upgrade (Ubuntu requirement)
+    - name: Perform mandatory dist-upgrade
       command: apt-get dist-upgrade -y
 
     - name: Check if reboot is required
@@ -56,25 +55,27 @@
       when: reboot_required.stat.exists
 
     ####################################################################
-    # HARD GATE: VERIFY UBUNTU ALLOWS UPGRADE
+    # PHASE 2 — ABSOLUTE HARD GATE (THIS IS THE KEY)
     ####################################################################
 
-    - name: Verify Ubuntu allows release upgrade
+    - name: Check release upgrade eligibility (Ubuntu gate)
       command: do-release-upgrade -c
       register: release_check
       changed_when: false
 
-    - name: Abort if Ubuntu blocks upgrade
+    - name: STOP if Ubuntu blocks the upgrade
       fail:
         msg: |
-          Ubuntu is blocking the upgrade.
-          This is NOT an AWX issue.
-          Output:
+          ❌ Ubuntu refused the release upgrade.
+          This is NOT an AWX or Ansible issue.
+          You MUST fix the OS state first.
+
+          Output from Ubuntu:
           {{ release_check.stdout }}
-      when: "'available' not in release_check.stdout"
+      when: "'New release' not in release_check.stdout"
 
     ####################################################################
-    # CONFIGURE RELEASE UPGRADER
+    # PHASE 3 — CONFIGURE RELEASE UPGRADER
     ####################################################################
 
     - name: Ensure update-manager-core is installed
@@ -89,12 +90,14 @@
         line: 'Prompt=lts'
 
     ####################################################################
-    # 20.04 → 22.04
+    # PHASE 4 — UPGRADE (WILL ONLY RUN IF GATE PASSES)
     ####################################################################
 
     - name: Upgrade Ubuntu 20.04 → 22.04
       command: do-release-upgrade -f DistUpgradeViewNonInteractive
-      when: ansible_distribution_version == "20.04"
+      when:
+        - ansible_distribution_version == "20.04"
+        - "'New release' in release_check.stdout"
       async: 14400
       poll: 30
 
@@ -102,10 +105,6 @@
       reboot:
         reboot_timeout: 1800
       when: ansible_distribution_version == "22.04"
-
-    ####################################################################
-    # 22.04 → 24.04
-    ####################################################################
 
     - name: Upgrade Ubuntu 22.04 → 24.04
       command: do-release-upgrade -f DistUpgradeViewNonInteractive
