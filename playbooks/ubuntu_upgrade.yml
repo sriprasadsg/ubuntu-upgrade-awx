@@ -1,5 +1,5 @@
 ---
-- name: Ubuntu 20.04 → 22.04 → 24.04 (AWX Safe & Gated)
+- name: Ubuntu Release Upgrade – Safe & Recoverable (AWX)
   hosts: all
   become: true
   gather_facts: true
@@ -7,7 +7,7 @@
 
   tasks:
     ####################################################################
-    # PHASE 1 — FORCE SYSTEM INTO A CLEAN STATE
+    # PHASE 1 — RECOVER BROKEN DPKG STATE (CRITICAL)
     ####################################################################
 
     - name: Stop unattended upgrades
@@ -17,23 +17,20 @@
         enabled: false
       ignore_errors: true
 
-    - name: Disable all third-party apt repositories (temporary)
-      shell: |
-        mkdir -p /root/apt-backup
-        if [ -d /etc/apt/sources.list.d ]; then
-          mv /etc/apt/sources.list.d/* /root/apt-backup/ 2>/dev/null || true
-        fi
-      args:
-        executable: /bin/bash
+    - name: Recover interrupted dpkg configuration
+      command: dpkg --configure -a
+      register: dpkg_fix
+      changed_when: false
+      failed_when: false
+
+    - name: Fix broken packages (after dpkg recovery)
+      command: apt-get -f install -y
+      register: fix_broken
+      changed_when: false
+      failed_when: false
 
     - name: Update apt cache
       command: apt-get update
-
-    - name: Fix broken packages
-      command: apt-get -f install -y
-
-    - name: Configure any unpacked packages
-      command: dpkg --configure -a
 
     - name: Remove held packages (if any)
       shell: |
@@ -44,8 +41,14 @@
       args:
         executable: /bin/bash
 
+    ####################################################################
+    # PHASE 2 — FORCE CLEAN SYSTEM STATE
+    ####################################################################
+
     - name: Mandatory full dist-upgrade
       command: apt-get dist-upgrade -y
+      register: dist_upgrade
+      failed_when: false
 
     - name: Check if reboot is required
       stat:
@@ -58,7 +61,7 @@
       when: reboot_required.stat.exists
 
     ####################################################################
-    # PHASE 2 — HARD GATE (UBUNTU DECIDES)
+    # PHASE 3 — UBUNTU READINESS GATE (HARD STOP)
     ####################################################################
 
     - name: Check Ubuntu release upgrade readiness
@@ -66,13 +69,15 @@
       register: release_check
       changed_when: false
 
-    - name: Stop if Ubuntu is not ready for upgrade
+    - name: Stop if Ubuntu is not ready
       fail:
         msg: |
-          ❌ Ubuntu is NOT ready for a release upgrade.
-          Automation is intentionally stopped.
+          ❌ Ubuntu is NOT ready for release upgrade.
 
-          You must fix this on the host first:
+          You must fix the OS state first.
+          Run manually on the host:
+            sudo dpkg --configure -a
+            sudo apt -f install
             sudo apt full-upgrade -y
             sudo reboot
             sudo do-release-upgrade -c
@@ -82,7 +87,7 @@
       when: "'New release' not in release_check.stdout"
 
     ####################################################################
-    # PHASE 3 — CONFIGURE RELEASE UPGRADER
+    # PHASE 4 — CONFIGURE RELEASE UPGRADER
     ####################################################################
 
     - name: Ensure update-manager-core is installed
@@ -97,7 +102,7 @@
         line: 'Prompt=lts'
 
     ####################################################################
-    # PHASE 4 — UPGRADE (ONLY RUNS IF GATE PASSES)
+    # PHASE 5 — RELEASE UPGRADE (ONLY IF READY)
     ####################################################################
 
     - name: Upgrade Ubuntu 20.04 → 22.04
