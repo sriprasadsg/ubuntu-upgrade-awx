@@ -1,0 +1,27 @@
+---
+- name: Post upgrade validation
+  hosts: all
+  become: true
+  gather_facts: true
+
+  tasks:
+    - name: Verify Ubuntu version
+      debug:
+        msg: "Upgraded Ubuntu Version: {{ ansible_distribution_version }}"
+
+    - name: Fail if upgrade not successful
+      fail:
+        msg: "Upgrade failed or incomplete"
+      when: ansible_distribution_version != "24.04"
+
+    - name: Enable unattended upgrades
+      systemd:
+        name: unattended-upgrades
+        state: started
+        enabled: true
+
+    - name: Clean unused packages
+      apt:
+        autoremove: yes
+        autoclean: yes
+

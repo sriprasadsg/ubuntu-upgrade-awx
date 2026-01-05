@@ -1,0 +1,41 @@
+---
+- name: Precheck Ubuntu system before OS upgrade
+  hosts: all
+  become: true
+  gather_facts: true
+
+  tasks:
+    - name: Ensure system is Ubuntu
+      fail:
+        msg: "This playbook supports Ubuntu only"
+      when: ansible_distribution != "Ubuntu"
+
+    - name: Check current Ubuntu version
+      debug:
+        msg: "Current Ubuntu Version: {{ ansible_distribution_version }}"
+
+    - name: Fail if not Ubuntu 20.04
+      fail:
+        msg: "This upgrade path is only for Ubuntu 20.04"
+      when: ansible_distribution_version != "20.04"
+
+    - name: Check disk space (minimum 10GB required)
+      assert:
+        that:
+          - ansible_facts['mounts'][0].size_available > 10000000000
+        fail_msg: "Not enough disk space for upgrade"
+
+    - name: Disable unattended upgrades
+      systemd:
+        name: unattended-upgrades
+        state: stopped
+        enabled: false
+      ignore_errors: true
+
+    - name: Update all packages
+      apt:
+        update_cache: yes
+        upgrade: dist
+        autoremove: yes
+        autoclean: yes
+

@@ -1,0 +1,44 @@
+---
+- name: Upgrade Ubuntu 20.04 to 24.04
+  hosts: all
+  become: true
+  gather_facts: true
+
+  tasks:
+    - name: Install update-manager-core
+      apt:
+        name: update-manager-core
+        state: present
+
+    - name: Ensure LTS upgrades are enabled
+      lineinfile:
+        path: /etc/update-manager/release-upgrades
+        regexp: '^Prompt='
+        line: 'Prompt=lts'
+
+    - name: Upgrade 20.04 → 22.04
+      command: do-release-upgrade -f DistUpgradeViewNonInteractive
+      when: ansible_distribution_version == "20.04"
+      register: upgrade_22
+      async: 3600
+      poll: 10
+
+    - name: Reboot after 22.04 upgrade
+      reboot:
+        reboot_timeout: 1800
+      when: upgrade_22 is changed
+
+    - name: Wait for system to become reachable
+      wait_for_connection:
+        timeout: 600
+
+    - name: Upgrade 22.04 → 24.04
+      command: do-release-upgrade -f DistUpgradeViewNonInteractive
+      when: ansible_distribution_version == "22.04"
+      async: 3600
+      poll: 10
+
+    - name: Final reboot
+      reboot:
+        reboot_timeout: 1800
+
