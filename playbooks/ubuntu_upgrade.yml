@@ -1,125 +1,27 @@
 ---
-- name: Ubuntu 20.04 → 22.04 → 24.04 (AWX Safe & Gated)
+- name: Ubuntu Release Upgrade – Readiness Gate ONLY
   hosts: all
   become: true
-  gather_facts: true
+  gather_facts: false
   serial: 1
 
   tasks:
-    ####################################################################
-    # PHASE 1 — FORCE SYSTEM INTO A CLEAN STATE
-    ####################################################################
-
-    - name: Stop unattended upgrades
-      systemd:
-        name: unattended-upgrades
-        state: stopped
-        enabled: false
-      ignore_errors: true
-
-    - name: Disable all third-party apt repositories (temporary)
-      shell: |
-        mkdir -p /root/apt-backup
-        if [ -d /etc/apt/sources.list.d ]; then
-          mv /etc/apt/sources.list.d/* /root/apt-backup/ 2>/dev/null || true
-        fi
-      args:
-        executable: /bin/bash
-
-    - name: Update apt cache
-      command: apt-get update
-
-    - name: Fix broken packages
-      command: apt-get -f install -y
-
-    - name: Configure any unpacked packages
-      command: dpkg --configure -a
-
-    - name: Remove held packages (if any)
-      shell: |
-        HELD=$(apt-mark showhold || true)
-        if [ -n "$HELD" ]; then
-          apt-mark unhold $HELD
-        fi
-      args:
-        executable: /bin/bash
-
-    - name: Mandatory full dist-upgrade
-      command: apt-get dist-upgrade -y
-
-    - name: Check if reboot is required
-      stat:
-        path: /var/run/reboot-required
-      register: reboot_required
-
-    - name: Reboot if required
-      reboot:
-        reboot_timeout: 1800
-      when: reboot_required.stat.exists
-
-    ####################################################################
-    # PHASE 2 — HARD GATE (UBUNTU DECIDES)
-    ####################################################################
-
     - name: Check Ubuntu release upgrade readiness
       command: do-release-upgrade -c
       register: release_check
       changed_when: false
 
-    - name: Stop if Ubuntu is not ready for upgrade
+    - name: Stop if Ubuntu is not ready
       fail:
         msg: |
-          ❌ Ubuntu is NOT ready for a release upgrade.
-          Automation is intentionally stopped.
-
-          You must fix this on the host first:
-            sudo apt full-upgrade -y
-            sudo reboot
-            sudo do-release-upgrade -c
+          ❌ Ubuntu is NOT ready for release upgrade.
+          AWX will not proceed.
 
           Ubuntu output:
           {{ release_check.stdout }}
       when: "'New release' not in release_check.stdout"
 
-    ####################################################################
-    # PHASE 3 — CONFIGURE RELEASE UPGRADER
-    ####################################################################
-
-    - name: Ensure update-manager-core is installed
-      apt:
-        name: update-manager-core
-        state: present
-
-    - name: Ensure LTS upgrades are enabled
-      lineinfile:
-        path: /etc/update-manager/release-upgrades
-        regexp: '^Prompt='
-        line: 'Prompt=lts'
-
-    ####################################################################
-    # PHASE 4 — UPGRADE (ONLY RUNS IF GATE PASSES)
-    ####################################################################
-
-    - name: Upgrade Ubuntu 20.04 → 22.04
-      command: do-release-upgrade -f DistUpgradeViewNonInteractive
-      when:
-        - ansible_distribution_version == "20.04"
-        - "'New release' in release_check.stdout"
-      async: 14400
-      poll: 30
-
-    - name: Reboot after 22.04 upgrade
-      reboot:
-        reboot_timeout: 1800
-      when: ansible_distribution_version == "22.04"
-
-    - name: Upgrade Ubuntu 22.04 → 24.04
-      command: do-release-upgrade -f DistUpgradeViewNonInteractive
-      when: ansible_distribution_version == "22.04"
-      async: 14400
-      poll: 30
-
-    - name: Final reboot
-      reboot:
-        reboot_timeout: 1800
+    - name: Ready for upgrade (gate passed)
+      debug:
+        msg: "Ubuntu reports a new LTS release is available. Safe to upgrade."
 
