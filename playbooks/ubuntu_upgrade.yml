@@ -1,11 +1,87 @@
 ---
-- name: Upgrade Ubuntu 20.04 to 24.04
+- name: Upgrade Ubuntu 20.04 → 22.04 → 24.04 safely
   hosts: all
   become: true
   gather_facts: true
+  serial: 1   # IMPORTANT: upgrade one host at a time
 
   tasks:
-    - name: Install update-manager-core
+    #######################################################################
+    # PRE-UPGRADE HARDENING (MANDATORY)
+    #######################################################################
+
+    - name: Stop unattended-upgrades
+      systemd:
+        name: unattended-upgrades
+        state: stopped
+        enabled: false
+      ignore_errors: true
+
+    - name: Backup and disable third-party apt sources
+      shell: |
+        mkdir -p /root/apt-backup
+        if [ -d /etc/apt/sources.list.d ] && [ "$(ls -A /etc/apt/sources.list.d)" ]; then
+          mv /etc/apt/sources.list.d/* /root/apt-backup/
+        fi
+      args:
+        executable: /bin/bash
+
+    - name: Update apt cache
+      apt:
+        update_cache: yes
+
+    - name: Fix broken packages
+      command: apt --fix-broken install -y
+      register: fix_broken
+      changed_when: false
+
+    - name: Remove held packages (if any)
+      shell: |
+        HELD=$(apt-mark showhold || true)
+        if [ -n "$HELD" ]; then
+          apt-mark unhold $HELD
+        fi
+      args:
+        executable: /bin/bash
+
+    - name: Full dist-upgrade (REQUIRED by Ubuntu)
+      apt:
+        upgrade: dist
+        autoremove: yes
+        autoclean: yes
+
+    - name: Check if reboot is required
+      stat:
+        path: /var/run/reboot-required
+      register: reboot_required
+
+    - name: Reboot if required before release upgrade
+      reboot:
+        reboot_timeout: 1800
+      when: reboot_required.stat.exists
+
+    #######################################################################
+    # RELEASE UPGRADE PRE-CHECK (FAIL FAST IF BLOCKED)
+    #######################################################################
+
+    - name: Check release upgrade availability
+      command: do-release-upgrade -c
+      register: release_check
+      changed_when: false
+
+    - name: Fail if Ubuntu blocks release upgrade
+      fail:
+        msg: |
+          Ubuntu is still blocking the release upgrade.
+          Output was:
+          {{ release_check.stdout }}
+      when: "'available' not in release_check.stdout"
+
+    #######################################################################
+    # 20.04 → 22.04
+    #######################################################################
+
+    - name: Ensure update-manager-core is installed
       apt:
         name: update-manager-core
         state: present
@@ -16,27 +92,26 @@
         regexp: '^Prompt='
         line: 'Prompt=lts'
 
-    - name: Upgrade 20.04 → 22.04
+    - name: Upgrade Ubuntu 20.04 → 22.04
       command: do-release-upgrade -f DistUpgradeViewNonInteractive
       when: ansible_distribution_version == "20.04"
-      register: upgrade_22
-      async: 3600
-      poll: 10
+      async: 14400
+      poll: 30
 
     - name: Reboot after 22.04 upgrade
       reboot:
         reboot_timeout: 1800
-      when: upgrade_22 is changed
+      when: ansible_distribution_version == "22.04"
 
-    - name: Wait for system to become reachable
-      wait_for_connection:
-        timeout: 600
+    #######################################################################
+    # 22.04 → 24.04
+    #######################################################################
 
-    - name: Upgrade 22.04 → 24.04
+    - name: Upgrade Ubuntu 22.04 → 24.04
       command: do-release-upgrade -f DistUpgradeViewNonInteractive
       when: ansible_distribution_version == "22.04"
-      async: 3600
-      poll: 10
+      async: 14400
+      poll: 30
 
     - name: Final reboot
       reboot:
