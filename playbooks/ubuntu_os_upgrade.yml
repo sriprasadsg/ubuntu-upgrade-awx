@@ -1,0 +1,36 @@
+---
+- name: Ubuntu OS Upgrade (Approval Required)
+  hosts: all
+  become: true
+  gather_facts: true
+  serial: 1
+
+  tasks:
+    - name: Ensure LTS upgrades are enabled
+      lineinfile:
+        path: /etc/update-manager/release-upgrades
+        regexp: '^Prompt='
+        line: 'Prompt=lts'
+
+    - name: Upgrade Ubuntu 20.04 → 22.04
+      command: do-release-upgrade -f DistUpgradeViewNonInteractive
+      async: 14400
+      poll: 30
+      when: ansible_distribution_version == "20.04"
+
+    - name: Reboot after 22.04
+      reboot:
+        reboot_timeout: 1800
+      when: ansible_distribution_version == "20.04"
+
+    - name: Upgrade Ubuntu 22.04 → 24.04
+      command: do-release-upgrade -f DistUpgradeViewNonInteractive
+      async: 14400
+      poll: 30
+      when: ansible_distribution_version == "22.04"
+
+    - name: Final reboot
+      reboot:
+        reboot_timeout: 1800
+      when: ansible_distribution_version == "22.04"
+
