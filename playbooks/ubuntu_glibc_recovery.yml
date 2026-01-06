@@ -1,0 +1,129 @@
+---
+- name: Ubuntu glibc / dpkg Recovery Playbook (CRITICAL FIX)
+  hosts: all
+  become: true
+  gather_facts: true
+  serial: 1
+
+  vars:
+    recovery_log: /var/log/awx-upgrade/glibc_recovery.log
+
+  tasks:
+    ####################################################################
+    # SAFETY CHECK
+    ####################################################################
+    - name: Fail if OS is not Ubuntu
+      fail:
+        msg: "This recovery playbook is ONLY for Ubuntu systems."
+      when: ansible_distribution != "Ubuntu"
+
+    ####################################################################
+    # PREPARE LOGGING
+    ####################################################################
+    - name: Create recovery log directory
+      file:
+        path: /var/log/awx-upgrade
+        state: directory
+        mode: '0755'
+
+    ####################################################################
+    # CHECK CURRENT libc6 STATE
+    ####################################################################
+    - name: Check libc6 installation status
+      shell: dpkg -l libc6 || true
+      register: libc_status
+      changed_when: false
+
+    - name: Log libc6 status
+      copy:
+        dest: "{{ recovery_log }}"
+        content: |
+          ===== libc6 status BEFORE =====
+          {{ libc_status.stdout }}
+
+    ####################################################################
+    # ENSURE JAMMY REPOSITORIES EXIST
+    ####################################################################
+    - name: Ensure Jammy main repository is present
+      copy:
+        dest: /etc/apt/sources.list.d/jammy-recovery.list
+        content: |
+          deb http://archive.ubuntu.com/ubuntu jammy main restricted universe multiverse
+          deb http://archive.ubuntu.com/ubuntu jammy-updates main restricted universe multiverse
+          deb http://archive.ubuntu.com/ubuntu jammy-security main restricted universe multiverse
+        mode: '0644'
+
+    ####################################################################
+    # UPDATE APT CACHE
+    ####################################################################
+    - name: Update apt cache
+      command: apt-get update
+      register: apt_update
+      failed_when: false
+
+    ####################################################################
+    # FORCE INSTALL libc6 + libc-bin (KEY STEP)
+    ####################################################################
+    - name: Force install libc6 and libc-bin
+      command: >
+        apt-get install -y
+        --allow-downgrades
+        --allow-change-held-packages
+        libc6 libc-bin
+      register: libc_install
+      failed_when: false
+
+    - name: Log libc6 installation output
+      lineinfile:
+        path: "{{ recovery_log }}"
+        line: |
+          ===== libc6 install output =====
+          {{ libc_install.stdout }}
+          {{ libc_install.stderr }}
+
+    ####################################################################
+    # RECOVER DPKG STATE
+    ####################################################################
+    - name: Run dpkg configuration recovery
+      command: dpkg --configure -a
+      register: dpkg_recover
+      failed_when: false
+
+    - name: Fix remaining dependencies
+      command: apt-get -f install -y
+      register: apt_fix
+      failed_when: false
+
+    ####################################################################
+    # FINAL STABILIZATION
+    ####################################################################
+    - name: Full upgrade to stabilize system
+      command: apt-get full-upgrade -y
+      register: full_upgrade
+      failed_when: false
+
+    ####################################################################
+    # VERIFY libc6 AFTER RECOVERY
+    ####################################################################
+    - name: Verify libc6 installation
+      command: dpkg -l libc6
+      register: libc_verify
+      changed_when: false
+
+    - name: Append final libc6 status
+      lineinfile:
+        path: "{{ recovery_log }}"
+        line: |
+          ===== libc6 status AFTER =====
+          {{ libc_verify.stdout }}
+
+    ####################################################################
+    # FINAL MESSAGE
+    ####################################################################
+    - name: Recovery summary
+      debug:
+        msg:
+          - "glibc recovery playbook completed"
+          - "Review {{ recovery_log }}"
+          - "Reboot REQUIRED before continuing"
+
