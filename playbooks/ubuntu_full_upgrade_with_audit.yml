@@ -1,0 +1,210 @@
+---
+- name: Ubuntu Software + OS Upgrade (Audited, Safe, AWX Ready)
+  hosts: all
+  become: true
+  gather_facts: true
+  serial: 1
+
+  vars:
+    log_dir: /var/log/awx-upgrade
+    lock_timeout: 1800      # 30 minutes max wait
+    lock_sleep: 10
+    retry_count: 3
+    retry_delay: 30
+
+  tasks:
+    ####################################################################
+    # PREPARE LOGGING
+    ####################################################################
+    - name: Create upgrade log directory
+      file:
+        path: "{{ log_dir }}"
+        state: directory
+        mode: '0755'
+
+    ####################################################################
+    # CAPTURE BEFORE STATE (INSTALLED PACKAGES)
+    ####################################################################
+    - name: Capture installed packages BEFORE upgrade
+      command: dpkg-query -W -f='${Package}\t${Version}\n'
+      register: packages_before
+      changed_when: false
+
+    - name: Save BEFORE package list
+      copy:
+        dest: "{{ log_dir }}/packages_before.txt"
+        content: "{{ packages_before.stdout }}"
+
+    ####################################################################
+    # RECOVER DPKG & BROKEN STATE
+    ####################################################################
+    - name: Recover dpkg state
+      command: dpkg --configure -a
+      failed_when: false
+
+    - name: Fix broken packages
+      command: apt-get -f install -y
+      failed_when: false
+
+    ####################################################################
+    # WAIT FOR APT LOCKS (AUTO RETRY + TIMEOUT)
+    ####################################################################
+    - name: Wait for apt/dpkg locks (with timeout)
+      shell: |
+        end=$((SECONDS+{{ lock_timeout }}))
+        while [ $SECONDS -lt $end ]; do
+          if ! fuser /var/lib/dpkg/lock-frontend >/dev/null 2>&1 && \
+             ! fuser /var/lib/dpkg/lock >/dev/null 2>&1 && \
+             ! fuser /var/cache/apt/archives/lock >/dev/null 2>&1; then
+            exit 0
+          fi
+          sleep {{ lock_sleep }}
+        done
+        echo "TIMEOUT waiting for apt lock"
+        exit 1
+      args:
+        executable: /bin/bash
+      register: lock_wait
+      failed_when: lock_wait.rc != 0
+
+    ####################################################################
+    # UPDATE CACHE
+    ####################################################################
+    - name: Update apt cache
+      apt:
+        update_cache: yes
+        cache_valid_time: 3600
+
+    ####################################################################
+    # LIST UPGRADABLE PACKAGES (PER-PACKAGE LOGGING)
+    ####################################################################
+    - name: Capture upgradable packages list
+      command: apt list --upgradable
+      register: upgradable_packages
+      changed_when: false
+
+    - name: Save upgradable package list
+      copy:
+        dest: "{{ log_dir }}/upgradable_packages.txt"
+        content: "{{ upgradable_packages.stdout }}"
+
+    ####################################################################
+    # SOFTWARE UPGRADE WITH RETRIES
+    ####################################################################
+    - name: Upgrade installed software (full-upgrade with retries)
+      apt:
+        upgrade: full
+        dpkg_options: "force-confdef,force-confold"
+      register: software_upgrade
+      retries: "{{ retry_count }}"
+      delay: "{{ retry_delay }}"
+      until: software_upgrade is succeeded
+
+    ####################################################################
+    # CLEANUP
+    ####################################################################
+    - name: Autoremove unused packages
+      apt:
+        autoremove: yes
+        purge: yes
+
+    - name: Clean apt cache
+      apt:
+        autoclean: yes
+
+    ####################################################################
+    # REBOOT IF REQUIRED
+    ####################################################################
+    - name: Check reboot requirement
+      stat:
+        path: /var/run/reboot-required
+      register: reboot_required
+
+    - name: Reboot if required
+      reboot:
+        reboot_timeout: 1800
+      when: reboot_required.stat.exists
+
+    ####################################################################
+    # CAPTURE AFTER STATE
+    ####################################################################
+    - name: Capture installed packages AFTER upgrade
+      command: dpkg-query -W -f='${Package}\t${Version}\n'
+      register: packages_after
+      changed_when: false
+
+    - name: Save AFTER package list
+      copy:
+        dest: "{{ log_dir }}/packages_after.txt"
+        content: "{{ packages_after.stdout }}"
+
+    ####################################################################
+    # BEFORE / AFTER DIFF
+    ####################################################################
+    - name: Generate package diff
+      shell: |
+        diff -u {{ log_dir }}/packages_before.txt {{ log_dir }}/packages_after.txt || true
+      register: package_diff
+      changed_when: false
+
+    - name: Save package diff
+      copy:
+        dest: "{{ log_dir }}/package_diff.txt"
+        content: "{{ package_diff.stdout | default('No differences detected') }}"
+
+    ####################################################################
+    # OS UPGRADE (ONLY AFTER SOFTWARE CLEAN STATE)
+    ####################################################################
+    - name: Ensure LTS upgrades enabled
+      lineinfile:
+        path: /etc/update-manager/release-upgrades
+        regexp: '^Prompt='
+        line: 'Prompt=lts'
+
+    - name: Upgrade Ubuntu 20.04 → 22.04
+      command: do-release-upgrade -f DistUpgradeViewNonInteractive
+      async: 14400
+      poll: 30
+      when: ansible_distribution_version == "20.04"
+      failed_when: false
+
+    - name: Reboot after 22.04
+      reboot:
+        reboot_timeout: 1800
+      when: ansible_distribution_version == "20.04"
+
+    - name: Upgrade Ubuntu 22.04 → 24.04
+      command: do-release-upgrade -f DistUpgradeViewNonInteractive
+      async: 14400
+      poll: 30
+      when: ansible_distribution_version == "22.04"
+      failed_when: false
+
+    - name: Final reboot
+      reboot:
+        reboot_timeout: 1800
+      when: ansible_distribution_version == "22.04"
+
+    ####################################################################
+    # FINAL OS VERSION
+    ####################################################################
+    - name: Capture final OS version
+      command: lsb_release -a
+      register: final_os
+      changed_when: false
+
+    - name: Save final OS version
+      copy:
+        dest: "{{ log_dir }}/final_os_version.txt"
+        content: "{{ final_os.stdout }}"
+
+    ####################################################################
+    # AWX ARTIFACT EXPORT
+    ####################################################################
+    - name: Export upgrade logs as AWX artifacts
+      set_stats:
+        data:
+          upgrade_logs_path: "{{ log_dir }}"
+          upgraded_packages_count: "{{ upgradable_packages.stdout_lines | length }}"
+          reboot_performed: "{{ reboot_required.stat.exists | default(false) }}"
+
