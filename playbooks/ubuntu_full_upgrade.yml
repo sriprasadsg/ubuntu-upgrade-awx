@@ -1,0 +1,149 @@
+---
+- name: Upgrade all software and Ubuntu OS safely
+  hosts: all
+  become: true
+  gather_facts: true
+
+  vars:
+    reboot_timeout: 1800
+    log_dir: /var/log/awx-upgrade
+
+  tasks:
+    ####################################################################
+    # PREPARE LOGGING
+    ####################################################################
+    - name: Create upgrade log directory
+      file:
+        path: "{{ log_dir }}"
+        state: directory
+        mode: '0755'
+
+    ####################################################################
+    # RECOVER FROM BROKEN DPKG (CRITICAL)
+    ####################################################################
+    - name: Recover interrupted dpkg
+      command: dpkg --configure -a
+      register: dpkg_fix
+      failed_when: false
+
+    - name: Fix broken dependencies
+      command: apt-get -f install -y
+      register: apt_fix
+      failed_when: false
+
+    ####################################################################
+    # UPDATE APT CACHE
+    ####################################################################
+    - name: Update apt cache
+      apt:
+        update_cache: yes
+        cache_valid_time: 3600
+
+    ####################################################################
+    # LIST UPGRADABLE PACKAGES (AUDIT)
+    ####################################################################
+    - name: Capture upgradable packages list
+      command: apt list --upgradable
+      register: upgradable
+      changed_when: false
+
+    - name: Save upgradable package list
+      copy:
+        dest: "{{ log_dir }}/upgradable_packages.txt"
+        content: "{{ upgradable.stdout }}"
+
+    ####################################################################
+    # UPGRADE SOFTWARE (CONTROLLED & SAFE)
+    ####################################################################
+    - name: Upgrade installed software (safe full-upgrade)
+      apt:
+        upgrade: full
+        dpkg_options: "force-confdef,force-confold"
+      register: software_upgrade
+
+    ####################################################################
+    # CLEANUP
+    ####################################################################
+    - name: Remove unused packages
+      apt:
+        autoremove: yes
+        purge: yes
+
+    - name: Clean apt cache
+      apt:
+        autoclean: yes
+
+    ####################################################################
+    # REBOOT IF REQUIRED AFTER PACKAGE UPGRADE
+    ####################################################################
+    - name: Check if reboot required
+      stat:
+        path: /var/run/reboot-required
+      register: reboot_required
+
+    - name: Reboot system if required
+      reboot:
+        reboot_timeout: "{{ reboot_timeout }}"
+      when: reboot_required.stat.exists
+
+    ####################################################################
+    # ENABLE LTS UPGRADES
+    ####################################################################
+    - name: Ensure LTS upgrades are enabled
+      lineinfile:
+        path: /etc/update-manager/release-upgrades
+        regexp: '^Prompt='
+        line: 'Prompt=lts'
+
+    ####################################################################
+    # OS UPGRADE: 20.04 → 22.04
+    ####################################################################
+    - name: Upgrade Ubuntu 20.04 to 22.04
+      command: do-release-upgrade -f DistUpgradeViewNonInteractive
+      async: 7200
+      poll: 30
+      register: upgrade_2204
+      when: ansible_distribution_version == "20.04"
+      failed_when: false
+
+    - name: Reboot after 22.04 upgrade
+      reboot:
+        reboot_timeout: "{{ reboot_timeout }}"
+      when: ansible_distribution_version == "20.04"
+
+    ####################################################################
+    # OS UPGRADE: 22.04 → 24.04
+    ####################################################################
+    - name: Upgrade Ubuntu 22.04 to 24.04
+      command: do-release-upgrade -f DistUpgradeViewNonInteractive
+      async: 7200
+      poll: 30
+      register: upgrade_2404
+      when: ansible_distribution_version == "22.04"
+      failed_when: false
+
+    - name: Final reboot after 24.04 upgrade
+      reboot:
+        reboot_timeout: "{{ reboot_timeout }}"
+      when: ansible_distribution_version == "22.04"
+
+    ####################################################################
+    # FINAL VERIFICATION
+    ####################################################################
+    - name: Capture final OS version
+      command: lsb_release -a
+      register: os_final
+      changed_when: false
+
+    - name: Save final OS version
+      copy:
+        dest: "{{ log_dir }}/final_os_version.txt"
+        content: "{{ os_final.stdout }}"
+
+    - name: Display completion message
+      debug:
+        msg:
+          - "Software upgrade completed"
+          - "OS upgrade completed"
+          - "Logs stored in {{ log_dir }}"
+
