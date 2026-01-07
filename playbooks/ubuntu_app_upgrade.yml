@@ -1,0 +1,80 @@
+---
+- name: Ubuntu Application Upgrade (APT + Snap – Safe & Non-Interactive)
+  hosts: all
+  become: true
+  gather_facts: false
+  serial: 1
+
+  vars:
+    report_dir: /var/log/awx-upgrade
+
+  tasks:
+    ####################################################################
+    # PREPARE LOG DIRECTORY
+    ####################################################################
+    - name: Ensure upgrade log directory exists
+      file:
+        path: "{{ report_dir }}"
+        state: directory
+        mode: '0755'
+
+    ####################################################################
+    # APT APPLICATION UPDATES
+    ####################################################################
+    - name: Update apt cache
+      apt:
+        update_cache: yes
+        cache_valid_time: 3600
+
+    - name: Upgrade APT packages
+      apt:
+        upgrade: full
+        dpkg_options: "force-confdef,force-confold"
+
+    ####################################################################
+    # SNAP APPLICATION UPDATES (SAFE / OPTIONAL)
+    ####################################################################
+    - name: Check if snapd service exists
+      shell: systemctl list-unit-files | grep -q snapd.service
+      register: snapd_exists
+      failed_when: false
+      changed_when: false
+
+    - name: Check if snapd service is running
+      shell: systemctl is-active snapd
+      register: snapd_running
+      failed_when: false
+      changed_when: false
+      when: snapd_exists.rc == 0
+
+    - name: Refresh snap packages (only if snapd is running)
+      command: snap refresh
+      register: snap_refresh
+      failed_when: false
+      when:
+        - snapd_exists.rc == 0
+        - snapd_running.stdout == "active"
+
+    - name: Save snap update status
+      copy:
+        dest: "{{ report_dir }}/snap_update.log"
+        content: |
+          snapd installed: {{ snapd_exists.rc == 0 }}
+          snapd status: {{ snapd_running.stdout | default('not installed or not running') }}
+
+          snap refresh output:
+          {{ snap_refresh.stdout | default('snap refresh skipped') }}
+
+    ####################################################################
+    # REBOOT IF REQUIRED AFTER APP UPDATES
+    ####################################################################
+    - name: Check if reboot is required
+      stat:
+        path: /var/run/reboot-required
+      register: reboot_required
+
+    - name: Reboot system if required
+      reboot:
+        reboot_timeout: 1800
+      when: reboot_required.stat.exists
+

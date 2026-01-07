@@ -1,0 +1,229 @@
+---
+- name: Ubuntu Inventory + Application Upgrade + Rollback Detection
+  hosts: all
+  become: true
+  gather_facts: true
+  serial: 1
+
+  vars:
+    report_dir: /var/log/awx-upgrade
+
+  tasks:
+    ####################################################################
+    # PREPARE LOGGING
+    ####################################################################
+    - name: Ensure report directory exists
+      file:
+        path: "{{ report_dir }}"
+        state: directory
+        mode: '0755'
+
+    ####################################################################
+    # CAPTURE PRE-UPGRADE STATE (INVENTORY)
+    ####################################################################
+    - name: Capture OS version (before)
+      command: lsb_release -a
+      register: os_before
+      changed_when: false
+
+    - name: Capture kernel version (before)
+      command: uname -r
+      register: kernel_before
+      changed_when: false
+
+    - name: Capture installed APT packages (before)
+      command: dpkg-query -W -f='${Package}\t${Version}\n'
+      register: apt_before
+      changed_when: false
+
+    - name: Capture snap packages (before)
+      command: snap list
+      register: snap_before
+      failed_when: false
+      changed_when: false
+
+    - name: Save pre-upgrade inventory
+      copy:
+        dest: "{{ report_dir }}/inventory_before.txt"
+        content: |
+          === OS ===
+          {{ os_before.stdout }}
+
+          === KERNEL ===
+          {{ kernel_before.stdout }}
+
+          === APT PACKAGES ===
+          {{ apt_before.stdout }}
+
+          === SNAP PACKAGES ===
+          {{ snap_before.stdout | default('snap not installed') }}
+
+    ####################################################################
+    # PRE-UPGRADE RISK DETECTION
+    ####################################################################
+    - name: Check held packages
+      command: apt-mark showhold
+      register: held
+      changed_when: false
+
+    - name: Check broken packages
+      command: dpkg -C
+      register: broken
+      failed_when: false
+      changed_when: false
+
+    - name: Check disk space
+      command: df -h /
+      register: disk
+      changed_when: false
+
+    - name: Fail if upgrade risks detected
+      fail:
+        msg: |
+          Upgrade risk detected.
+          Held packages:
+          {{ held.stdout }}
+
+          Broken packages:
+          {{ broken.stdout }}
+
+          Disk status:
+          {{ disk.stdout }}
+      when: held.stdout != "" or broken.stdout != ""
+
+    ####################################################################
+    # APPLICATION UPGRADE — APT
+    ####################################################################
+    - name: Update apt cache
+      apt:
+        update_cache: yes
+        cache_valid_time: 3600
+
+    - name: Upgrade APT applications
+      apt:
+        upgrade: full
+        dpkg_options: "force-confdef,force-confold"
+
+    ####################################################################
+    # APPLICATION UPGRADE — SNAP (SAFE)
+    ####################################################################
+    - name: Check if snapd service exists
+      shell: systemctl list-unit-files | grep -q snapd.service
+      register: snapd_exists
+      failed_when: false
+      changed_when: false
+
+    - name: Check if snapd service is running
+      shell: systemctl is-active snapd
+      register: snapd_running
+      failed_when: false
+      changed_when: false
+      when: snapd_exists.rc == 0
+
+    - name: Refresh snap packages (only if snapd is running)
+      command: snap refresh
+      register: snap_refresh
+      failed_when: false
+      when:
+        - snapd_exists.rc == 0
+        - snapd_running.stdout == "active"
+
+    ####################################################################
+    # REBOOT IF REQUIRED AFTER APP UPGRADES
+    ####################################################################
+    - name: Check if reboot is required
+      stat:
+        path: /var/run/reboot-required
+      register: reboot_required
+
+    - name: Reboot system if required
+      reboot:
+        reboot_timeout: 1800
+      when: reboot_required.stat.exists
+
+    - name: Refresh facts after reboot
+      setup:
+
+    ####################################################################
+    # CAPTURE POST-UPGRADE STATE
+    ####################################################################
+    - name: Capture OS version (after)
+      command: lsb_release -a
+      register: os_after
+      changed_when: false
+
+    - name: Capture kernel version (after)
+      command: uname -r
+      register: kernel_after
+      changed_when: false
+
+    - name: Capture installed APT packages (after)
+      command: dpkg-query -W -f='${Package}\t${Version}\n'
+      register: apt_after
+      changed_when: false
+
+    - name: Capture snap packages (after)
+      command: snap list
+      register: snap_after
+      failed_when: false
+      changed_when: false
+
+    - name: Save post-upgrade inventory
+      copy:
+        dest: "{{ report_dir }}/inventory_after.txt"
+        content: |
+          === OS ===
+          {{ os_after.stdout }}
+
+          === KERNEL ===
+          {{ kernel_after.stdout }}
+
+          === APT PACKAGES ===
+          {{ apt_after.stdout }}
+
+          === SNAP PACKAGES ===
+          {{ snap_after.stdout | default('snap not installed') }}
+
+    ####################################################################
+    # ROLLBACK DETECTION
+    ####################################################################
+    - name: Detect OS rollback
+      fail:
+        msg: |
+          OS rollback detected!
+          Before:
+          {{ os_before.stdout }}
+          After:
+          {{ os_after.stdout }}
+      when: os_before.stdout != os_after.stdout and
+            os_after.stdout is search("Ubuntu") == false
+
+    - name: Detect kernel rollback
+      fail:
+        msg: |
+          Kernel rollback detected!
+          Before: {{ kernel_before.stdout }}
+          After: {{ kernel_after.stdout }}
+      when: kernel_after.stdout is version(kernel_before.stdout, '<')
+
+    - name: Generate package diff
+      shell: |
+        diff -u {{ report_dir }}/inventory_before.txt {{ report_dir }}/inventory_after.txt || true
+      register: pkg_diff
+      changed_when: false
+
+    - name: Save package diff
+      copy:
+        dest: "{{ report_dir }}/package_diff.txt"
+        content: "{{ pkg_diff.stdout | default('No differences detected') }}"
+
+    ####################################################################
+    # FINAL SUMMARY
+    ####################################################################
+    - name: Upgrade summary
+      debug:
+        msg:
+          - "Inventory + application upgrade completed"
+          - "Reports stored in {{ report_dir }}"
+          - "No rollback detected"
+

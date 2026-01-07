@@ -1,27 +1,44 @@
 ---
-- name: Post upgrade validation
+- name: Ubuntu Post-Upgrade Validation
   hosts: all
   become: true
   gather_facts: true
+  serial: 1
+
+  vars:
+    report_dir: /var/log/awx-upgrade
 
   tasks:
-    - name: Verify Ubuntu version
-      debug:
-        msg: "Upgraded Ubuntu Version: {{ ansible_distribution_version }}"
+    - name: Capture OS version
+      command: lsb_release -a
+      register: os
+      changed_when: false
 
-    - name: Fail if upgrade not successful
+    - name: Capture kernel version
+      command: uname -r
+      register: kernel
+      changed_when: false
+
+    - name: Check failed services
+      command: systemctl --failed
+      register: failed_services
+      changed_when: false
+
+    - name: Save validation report
+      copy:
+        dest: "{{ report_dir }}/post_upgrade_validation.txt"
+        content: |
+          === OS VERSION ===
+          {{ os.stdout }}
+
+          === KERNEL ===
+          {{ kernel.stdout }}
+
+          === FAILED SERVICES ===
+          {{ failed_services.stdout | default('None') }}
+
+    - name: Fail if services are down
       fail:
-        msg: "Upgrade failed or incomplete"
-      when: ansible_distribution_version != "24.04"
-
-    - name: Enable unattended upgrades
-      systemd:
-        name: unattended-upgrades
-        state: started
-        enabled: true
-
-    - name: Clean unused packages
-      apt:
-        autoremove: yes
-        autoclean: yes
+        msg: "Post-upgrade validation failed. Check failed services."
+      when: "'failed' in failed_services.stdout"
 

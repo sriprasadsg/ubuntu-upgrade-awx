@@ -1,0 +1,76 @@
+---
+- name: Ubuntu Inventory & Risk Detection
+  hosts: all
+  become: true
+  gather_facts: true
+  serial: 1
+
+  vars:
+    report_dir: /var/log/awx-upgrade
+
+  tasks:
+    - name: Create report directory
+      file:
+        path: "{{ report_dir }}"
+        state: directory
+        mode: '0755'
+
+    ########################
+    # APPLICATION INVENTORY
+    ########################
+    - name: List installed APT packages
+      command: dpkg-query -W -f='${Package}\t${Version}\n'
+      register: apt_pkgs
+      changed_when: false
+
+    - name: List snap packages
+      command: snap list
+      register: snap_pkgs
+      changed_when: false
+
+    - name: List enabled services
+      command: systemctl list-unit-files --state=enabled
+      register: services
+      changed_when: false
+
+    - name: Save inventory report
+      copy:
+        dest: "{{ report_dir }}/inventory.txt"
+        content: |
+          === APT PACKAGES ===
+          {{ apt_pkgs.stdout }}
+
+          === SNAP PACKAGES ===
+          {{ snap_pkgs.stdout }}
+
+          === ENABLED SERVICES ===
+          {{ services.stdout }}
+
+    ########################
+    # PRE-UPGRADE RISK CHECKS
+    ########################
+    - name: Check held packages
+      command: apt-mark showhold
+      register: held
+      changed_when: false
+
+    - name: Check broken packages
+      command: dpkg -C
+      register: broken
+      failed_when: false
+      changed_when: false
+
+    - name: Check disk space
+      command: df -h /
+      register: disk
+      changed_when: false
+
+    - name: Fail if risks detected
+      fail:
+        msg: |
+          Upgrade risk detected.
+          Held packages: {{ held.stdout }}
+          Broken packages: {{ broken.stdout }}
+          Disk status: {{ disk.stdout }}
+      when: held.stdout != "" or broken.stdout != ""
+
