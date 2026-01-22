@@ -1,0 +1,89 @@
+---
+- name: Ubuntu OS Upgrade (Guarded, Live, Rollback-Aware)
+  hosts: all
+  become: true
+  gather_facts: true
+  serial: 1
+
+  vars:
+    upgrade_cmd: /usr/bin/do-release-upgrade
+    max_retries: 2
+
+  tasks:
+    ####################################################################
+    # PREPARE
+    ####################################################################
+    - name: Capture OS version BEFORE
+      command: cat /etc/os-release
+      register: os_before
+      changed_when: false
+
+    - name: Capture kernel BEFORE
+      command: uname -r
+      register: kernel_before
+      changed_when: false
+
+    - name: Ensure upgrade tools installed
+      apt:
+        name:
+          - ubuntu-release-upgrader-core
+          - update-manager-core
+        state: present
+        update_cache: yes
+
+    - name: Enable LTS upgrades
+      lineinfile:
+        path: /etc/update-manager/release-upgrades
+        regexp: '^Prompt='
+        line: 'Prompt=lts'
+
+    ####################################################################
+    # OS UPGRADE (LIVE + RETRY)
+    ####################################################################
+    - name: Run OS upgrade (live)
+      shell: |
+        {{ upgrade_cmd }} -f DistUpgradeViewNonInteractive | tee /var/log/awx-upgrade/os_upgrade.log
+      args:
+        executable: /bin/bash
+      async: 14400
+      poll: 30
+      register: os_upgrade
+      retries: "{{ max_retries }}"
+      delay: 60
+      until: os_upgrade.rc == 0
+      failed_when: os_upgrade.rc not in [0]
+
+    - name: Reboot after OS upgrade
+      reboot:
+        reboot_timeout: 1800
+
+    - name: Refresh facts
+      setup:
+
+    ####################################################################
+    # ROLLBACK DETECTION
+    ####################################################################
+    - name: Capture OS version AFTER
+      command: cat /etc/os-release
+      register: os_after
+      changed_when: false
+
+    - name: Capture kernel AFTER
+      command: uname -r
+      register: kernel_after
+      changed_when: false
+
+    - name: Detect OS rollback
+      fail:
+        msg: |
+          OS rollback detected!
+          BEFORE:
+          {{ os_before.stdout }}
+          AFTER:
+          {{ os_after.stdout }}
+      when: os_before.stdout == os_after.stdout
+
+    - name: Detect kernel downgrade
+      fail:
+        msg: "Kernel rollback detected"
+      when: kernel_after.stdout is version(kernel_before.stdout, '<')
