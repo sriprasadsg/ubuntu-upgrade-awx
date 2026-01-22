@@ -1,0 +1,92 @@
+---
+- name: Ubuntu Precheck + Inventory + App Upgrade
+  hosts: all
+  become: true
+  gather_facts: true
+  serial: 1
+
+  vars:
+    log_dir: /var/log/awx-upgrade
+    min_disk_gb: 20
+    min_ram_mb: 2048
+
+  tasks:
+    ####################################################################
+    # PRECHECKS (FAIL FAST)
+    ####################################################################
+    - name: Ensure Ubuntu
+      fail:
+        msg: "Unsupported OS"
+      when: ansible_distribution != "Ubuntu"
+
+    - name: Check disk space
+      assert:
+        that:
+          - ansible_facts.mounts | selectattr('mount', 'equalto', '/') | map(attribute='size_available') | first | int > (min_disk_gb * 1024 * 1024 * 1024)
+        fail_msg: "Insufficient disk space (< {{ min_disk_gb }}GB)"
+
+    - name: Check RAM
+      assert:
+        that:
+          - ansible_memtotal_mb >= min_ram_mb
+        fail_msg: "Insufficient RAM (< {{ min_ram_mb }}MB)"
+
+    ####################################################################
+    # LOGGING SETUP
+    ####################################################################
+    - name: Ensure log directory exists
+      file:
+        path: "{{ log_dir }}"
+        state: directory
+        mode: '0755'
+
+    ####################################################################
+    # INVENTORY (LIVE OUTPUT)
+    ####################################################################
+    - name: Capture installed packages
+      shell: |
+        dpkg-query -W -f='${Package}\t${Version}\n' | tee {{ log_dir }}/packages_before.txt
+      args:
+        executable: /bin/bash
+      changed_when: false
+
+    ####################################################################
+    # PACKAGE RECOVERY
+    ####################################################################
+    - name: Recover dpkg
+      command: dpkg --configure -a
+      failed_when: false
+
+    - name: Fix broken packages
+      apt:
+        fix_broken: yes
+        update_cache: yes
+
+    ####################################################################
+    # APPLICATION UPGRADE
+    ####################################################################
+    - name: Upgrade applications (live output)
+      shell: |
+        apt-get update &&
+        apt-get -y full-upgrade
+      args:
+        executable: /bin/bash
+      async: 7200
+      poll: 15
+      register: app_upgrade
+
+    ####################################################################
+    # REBOOT IF REQUIRED
+    ####################################################################
+    - name: Check reboot required
+      stat:
+        path: /var/run/reboot-required
+      register: reboot_required
+
+    - name: Reboot after app upgrade
+      reboot:
+        reboot_timeout: 1800
+      when: reboot_required.stat.exists
+
+    - name: Refresh facts
+      setup:
