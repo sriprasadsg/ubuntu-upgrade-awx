@@ -1,0 +1,229 @@
+---
+- name: Software Inventory + Repo Fix + App Upgrade + OS Upgrade
+  hosts: all
+  become: true
+  gather_facts: true
+  serial: 1
+
+  vars:
+    log_dir: /var/log/awx-upgrade
+    upgrade_cmd: /usr/bin/do-release-upgrade
+
+    # SAFE, OFFICIAL repositories only
+    software_repos:
+      docker:
+        repo: "deb [arch=amd64] https://download.docker.com/linux/ubuntu {{ ansible_distribution_release }} stable"
+        key_url: https://download.docker.com/linux/ubuntu/gpg
+      terraform:
+        repo: "deb [arch=amd64] https://apt.releases.hashicorp.com {{ ansible_distribution_release }} main"
+        key_url: https://apt.releases.hashicorp.com/gpg
+
+  tasks:
+    ####################################################################
+    # SAFETY CHECK
+    ####################################################################
+    - name: Ensure system is Ubuntu
+      fail:
+        msg: "This playbook supports Ubuntu only"
+      when: ansible_distribution != "Ubuntu"
+
+    ####################################################################
+    # PREPARE LOGGING
+    ####################################################################
+    - name: Ensure log directory exists
+      file:
+        path: "{{ log_dir }}"
+        state: directory
+        mode: '0755'
+
+    ####################################################################
+    # INVENTORY (BEFORE)
+    ####################################################################
+    - name: Capture OS version (before)
+      command: cat /etc/os-release
+      register: os_before
+      changed_when: false
+
+    - name: Capture installed packages (before)
+      command: dpkg-query -W -f='${Package}\t${Version}\n'
+      register: pkgs_before
+      changed_when: false
+
+    - name: Save pre-upgrade inventory
+      copy:
+        dest: "{{ log_dir }}/packages_before.txt"
+        content: "{{ pkgs_before.stdout }}"
+
+    ####################################################################
+    # FIX PACKAGE / REPO ISSUES
+    ####################################################################
+    - name: Recover dpkg state
+      command: dpkg --configure -a
+      failed_when: false
+
+    - name: Fix broken dependencies
+      apt:
+        fix_broken: yes
+        update_cache: yes
+
+    ####################################################################
+    # ADD REQUIRED REPOSITORIES (RULE-BASED)
+    ####################################################################
+    - name: Add Docker GPG key
+      apt_key:
+        url: "{{ software_repos.docker.key_url }}"
+        state: present
+      when: "'docker' in pkgs_before.stdout"
+
+    - name: Add Docker repository
+      apt_repository:
+        repo: "{{ software_repos.docker.repo }}"
+        state: present
+      when: "'docker' in pkgs_before.stdout"
+
+    - name: Add HashiCorp GPG key
+      apt_key:
+        url: "{{ software_repos.terraform.key_url }}"
+        state: present
+      when: "'terraform' in pkgs_before.stdout"
+
+    - name: Add HashiCorp repository
+      apt_repository:
+        repo: "{{ software_repos.terraform.repo }}"
+        state: present
+      when: "'terraform' in pkgs_before.stdout"
+
+    ####################################################################
+    # APPLICATION UPGRADE
+    ####################################################################
+    - name: Update apt cache
+      apt:
+        update_cache: yes
+        cache_valid_time: 3600
+
+    - name: Upgrade installed applications
+      apt:
+        upgrade: full
+        dpkg_options: "force-confdef,force-confold"
+
+    - name: Check reboot required after app upgrade
+      stat:
+        path: /var/run/reboot-required
+      register: reboot_app
+
+    - name: Reboot after app upgrade (if required)
+      reboot:
+        reboot_timeout: 1800
+      when: reboot_app.stat.exists
+
+    - name: Refresh facts
+      setup:
+
+    ####################################################################
+    # ENSURE OS UPGRADE TOOLS
+    ####################################################################
+    - name: Ensure OS upgrade utilities are installed
+      apt:
+        name:
+          - ubuntu-release-upgrader-core
+          - update-manager-core
+        state: present
+        update_cache: yes
+
+    - name: Ensure LTS upgrades enabled
+      lineinfile:
+        path: /etc/update-manager/release-upgrades
+        regexp: '^Prompt='
+        line: 'Prompt=lts'
+
+    ####################################################################
+    # OS UPGRADE (VERSION-AWARE)
+    ####################################################################
+    - name: Display detected Ubuntu version
+      debug:
+        msg: "Current Ubuntu version: {{ ansible_distribution_version }}"
+
+    # 18.04 → 20.04
+    - name: Upgrade Ubuntu 18.04 → 20.04
+      command: "{{ upgrade_cmd }} -f DistUpgradeViewNonInteractive"
+      async: 14400
+      poll: 30
+      when: ansible_distribution_version == "18.04"
+
+    - name: Reboot after 20.04 upgrade
+      reboot:
+        reboot_timeout: 1800
+      when: ansible_distribution_version == "18.04"
+
+    - name: Refresh facts
+      setup:
+
+    # 20.04 → 22.04
+    - name: Upgrade Ubuntu 20.04 → 22.04
+      command: "{{ upgrade_cmd }} -f DistUpgradeViewNonInteractive"
+      async: 14400
+      poll: 30
+      when: ansible_distribution_version == "20.04"
+
+    - name: Reboot after 22.04 upgrade
+      reboot:
+        reboot_timeout: 1800
+      when: ansible_distribution_version == "20.04"
+
+    - name: Refresh facts
+      setup:
+
+    # 22.04 → 24.04
+    - name: Upgrade Ubuntu 22.04 → 24.04
+      command: "{{ upgrade_cmd }} -f DistUpgradeViewNonInteractive"
+      async: 14400
+      poll: 30
+      when: ansible_distribution_version == "22.04"
+
+    - name: Final reboot after OS upgrade
+      reboot:
+        reboot_timeout: 1800
+      when: ansible_distribution_version == "22.04"
+
+    ####################################################################
+    # POST-UPGRADE AUDIT
+    ####################################################################
+    - name: Refresh facts after final reboot
+      setup:
+
+    - name: Capture OS version (after)
+      command: cat /etc/os-release
+      register: os_after
+      changed_when: false
+
+    - name: Capture installed packages (after)
+      command: dpkg-query -W -f='${Package}\t${Version}\n'
+      register: pkgs_after
+      changed_when: false
+
+    - name: Save post-upgrade inventory
+      copy:
+        dest: "{{ log_dir }}/packages_after.txt"
+        content: "{{ pkgs_after.stdout }}"
+
+    - name: Generate package diff
+      shell: |
+        diff -u {{ log_dir }}/packages_before.txt {{ log_dir }}/packages_after.txt || true
+      register: pkg_diff
+      changed_when: false
+
+    - name: Save package diff
+      copy:
+        dest: "{{ log_dir }}/package_diff.txt"
+        content: "{{ pkg_diff.stdout | default('No changes detected') }}"
+
+    ####################################################################
+    # SUMMARY
+    ####################################################################
+    - name: Upgrade summary
+      debug:
+        msg:
+          - "Applications upgraded"
+          - "Repositories validated"
+          - "OS upgrade completed (if applicable)"
+          - "Logs available in {{ log_dir }}"
