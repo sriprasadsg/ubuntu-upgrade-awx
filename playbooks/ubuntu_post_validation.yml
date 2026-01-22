@@ -1,0 +1,15 @@
+---
+- name: Ubuntu Post-Upgrade Validation
+  hosts: all
+  become: true
+
+  tasks:
+    - name: Check failed services
+      command: systemctl --failed
+      register: failed_services
+      changed_when: false
+
+    - name: Fail if services are down
+      fail:
+        msg: "Failed services detected"
+      when: "'failed' in failed_services.stdout"
