@@ -1,0 +1,140 @@
+---
+- name: Ubuntu App + Security + OS Upgrade (20.04 → 22.04 → 24.04) with Live Progress
+  hosts: all
+  become: true
+  gather_facts: true
+  serial: 1
+
+  vars:
+    upgrade_cmd: /usr/bin/do-release-upgrade
+    log_dir: /var/log/awx-upgrade
+
+  tasks:
+    ####################################################################
+    # SAFETY CHECKS
+    ####################################################################
+    - name: Ensure system is Ubuntu
+      fail:
+        msg: "This playbook supports Ubuntu only"
+      when: ansible_distribution != "Ubuntu"
+
+    ####################################################################
+    # PREPARE LOGGING
+    ####################################################################
+    - name: Ensure log directory exists
+      file:
+        path: "{{ log_dir }}"
+        state: directory
+        mode: '0755'
+
+    ####################################################################
+    # ENSURE REQUIRED TOOLS
+    ####################################################################
+    - name: Ensure OS upgrade utilities are installed
+      apt:
+        name:
+          - ubuntu-release-upgrader-core
+          - update-manager-core
+        state: present
+        update_cache: yes
+
+    - name: Ensure LTS upgrades are enabled
+      lineinfile:
+        path: /etc/update-manager/release-upgrades
+        regexp: '^Prompt='
+        line: 'Prompt=lts'
+
+    ####################################################################
+    # APPLICATION + SECURITY UPDATES (LIVE OUTPUT)
+    ####################################################################
+    - name: Update apt cache (live)
+      shell: |
+        apt-get update 2>&1 | tee {{ log_dir }}/apt_update.log
+      args:
+        executable: /bin/bash
+
+    - name: Install security updates (live)
+      shell: |
+        unattended-upgrade -d 2>&1 | tee {{ log_dir }}/security_updates.log || true
+      args:
+        executable: /bin/bash
+
+    - name: Full application upgrade (live)
+      shell: |
+        apt-get -y full-upgrade 2>&1 | tee {{ log_dir }}/app_upgrade.log
+      args:
+        executable: /bin/bash
+      async: 7200
+      poll: 20
+
+    ####################################################################
+    # REBOOT AFTER APP / SECURITY UPDATES
+    ####################################################################
+    - name: Check reboot required
+      stat:
+        path: /var/run/reboot-required
+      register: reboot_required
+
+    - name: Reboot after app/security updates
+      reboot:
+        reboot_timeout: 1800
+      when: reboot_required.stat.exists
+
+    - name: Refresh facts
+      setup:
+
+    ####################################################################
+    # DISPLAY CURRENT VERSION
+    ####################################################################
+    - name: Display current Ubuntu version
+      debug:
+        msg: "Current Ubuntu version: {{ ansible_distribution_version }}"
+
+    ####################################################################
+    # 20.04 → 22.04 OS UPGRADE (LIVE)
+    ####################################################################
+    - name: Upgrade Ubuntu 20.04 → 22.04 (live)
+      shell: |
+        {{ upgrade_cmd }} -f DistUpgradeViewNonInteractive 2>&1 | tee {{ log_dir }}/os_upgrade_20_to_22.log
+      args:
+        executable: /bin/bash
+      async: 14400
+      poll: 30
+      when: ansible_distribution_version == "20.04"
+
+    - name: Reboot after 22.04 upgrade
+      reboot:
+        reboot_timeout: 1800
+      when: ansible_distribution_version == "20.04"
+
+    - name: Refresh facts after 22.04 upgrade
+      setup:
+
+    ####################################################################
+    # 22.04 → 24.04 OS UPGRADE (LIVE)
+    ####################################################################
+    - name: Upgrade Ubuntu 22.04 → 24.04 (live)
+      shell: |
+        {{ upgrade_cmd }} -f DistUpgradeViewNonInteractive 2>&1 | tee {{ log_dir }}/os_upgrade_22_to_24.log
+      args:
+        executable: /bin/bash
+      async: 14400
+      poll: 30
+      when: ansible_distribution_version == "22.04"
+
+    - name: Final reboot after 24.04 upgrade
+      reboot:
+        reboot_timeout: 1800
+      when: ansible_distribution_version == "22.04"
+
+    ####################################################################
+    # FINAL VALIDATION
+    ####################################################################
+    - name: Refresh facts after final reboot
+      setup:
+
+    - name: Display final OS version
+      debug:
+        msg:
+          - "Final OS: {{ ansible_distribution }}"
+          - "Version: {{ ansible_distribution_version }}"
