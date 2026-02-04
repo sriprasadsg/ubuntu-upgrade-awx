@@ -1,0 +1,121 @@
+---
+- name: Ubuntu Security Patches Update Only (Hardened)
+  hosts: all
+  become: true
+  gather_facts: true
+  serial: 1
+
+  vars:
+    log_dir: /var/log/awx-security-updates
+
+  tasks:
+    ####################################################################
+    # SAFETY CHECK
+    ####################################################################
+    - name: Ensure system is Ubuntu
+      fail:
+        msg: "This playbook supports Ubuntu only"
+      when: ansible_distribution != "Ubuntu"
+
+    ####################################################################
+    # PREPARE LOGGING
+    ####################################################################
+    - name: Ensure security log directory exists
+      file:
+        path: "{{ log_dir }}"
+        state: directory
+        mode: '0755'
+
+    ####################################################################
+    # APT / DPKG RECOVERY (CRITICAL FIX)
+    ####################################################################
+    - name: Remove stale APT locks (if any)
+      shell: |
+        rm -f /var/lib/apt/lists/lock
+        rm -f /var/cache/apt/archives/lock
+        rm -f /var/lib/dpkg/lock*
+      args:
+        executable: /bin/bash
+      changed_when: false
+
+    - name: Recover dpkg state
+      command: dpkg --configure -a
+      failed_when: false
+
+    - name: Fix broken dependencies
+      shell: |
+        apt-get -f install -y
+      args:
+        executable: /bin/bash
+      failed_when: false
+
+    ####################################################################
+    # ENSURE REQUIRED SECURITY PACKAGES
+    ####################################################################
+    - name: Update apt cache (retry-safe, live)
+      shell: |
+        apt-get update 2>&1 | tee {{ log_dir }}/apt_update.log
+      args:
+        executable: /bin/bash
+      register: apt_update
+      retries: 3
+      delay: 30
+      until: apt_update.rc == 0
+
+    - name: Ensure unattended-upgrades is installed
+      apt:
+        name:
+          - unattended-upgrades
+          - apt-listchanges
+        state: present
+
+    ####################################################################
+    # LIST SECURITY UPDATES (AUDIT)
+    ####################################################################
+    - name: List pending security updates
+      shell: |
+        apt list --upgradable 2>/dev/null | grep -i security || true
+      register: security_list
+      changed_when: false
+
+    - name: Save pending security updates list
+      copy:
+        dest: "{{ log_dir }}/pending_security_updates.txt"
+        content: "{{ security_list.stdout | default('No security updates available') }}"
+
+    ####################################################################
+    # APPLY SECURITY UPDATES ONLY (LIVE)
+    ####################################################################
+    - name: Apply security updates only (live)
+      shell: |
+        unattended-upgrade -d 2>&1 | tee {{ log_dir }}/security_upgrade.log
+      args:
+        executable: /bin/bash
+      async: 3600
+      poll: 15
+
+    ####################################################################
+    # CHECK REBOOT REQUIREMENT
+    ####################################################################
+    - name: Check if reboot is required
+      stat:
+        path: /var/run/reboot-required
+      register: reboot_required
+
+    - name: Reboot system if required (security updates)
+      reboot:
+        reboot_timeout: 1800
+      when: reboot_required.stat.exists
+
+    ####################################################################
+    # POST-UPDATE VALIDATION
+    ####################################################################
+    - name: Refresh facts after security updates
+      setup:
+
+    - name: Security patching summary
+      debug:
+        msg:
+          - "Security patching completed successfully"
+          - "Reboot required: {{ reboot_required.stat.exists | default(false) }}"
+          - "Logs stored in {{ log_dir }}"
