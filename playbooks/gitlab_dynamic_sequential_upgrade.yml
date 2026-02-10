@@ -1,0 +1,123 @@
+---
+- name: Dynamic GitLab Sequential Upgrade (Safe)
+  hosts: gitlab
+  become: yes
+  serial: 1
+
+  vars:
+    gitlab_pkg: gitlab-ee
+    avg_upgrade_minutes_per_version: 15
+
+  tasks:
+
+    - name: Get installed GitLab version
+      shell: |
+        dpkg-query -W -f='${Version}' gitlab-ee | cut -d'-' -f1
+      register: installed_version
+      changed_when: false
+
+    - set_fact:
+        current_version: "{{ installed_version.stdout }}"
+
+    - debug:
+        msg: "Current GitLab version detected: {{ current_version }}"
+
+    - name: Get all available GitLab versions from apt
+      shell: |
+        apt-cache madison gitlab-ee | awk '{print $3}' | cut -d'-' -f1
+      register: available_versions
+      changed_when: false
+
+    - name: Filter versions higher than installed
+      set_fact:
+        higher_versions: >-
+          {{
+            available_versions.stdout_lines
+            | select('version_compare', current_version, '>')
+            | list
+          }}
+
+    - name: Group versions by major.minor
+      set_fact:
+        grouped_versions: >-
+          {{
+            higher_versions
+            | map('regex_replace', '^([0-9]+\\.[0-9]+)\\..*', '\\1')
+            | unique
+            | list
+          }}
+
+    - name: Pick latest patch version per minor
+      set_fact:
+        upgrade_path: >-
+          {{
+            grouped_versions
+            | map('extract', dict(
+                grouped_versions | zip(
+                  grouped_versions | map('regex_escape')
+                )
+              ))
+          }}
+
+    - name: Build ordered upgrade path
+      set_fact:
+        upgrade_versions: >-
+          {{
+            grouped_versions
+            | map('regex_replace', '^(.*)$',
+                higher_versions
+                | select('match', '^\\1\\.')
+                | sort(version=True)
+                | last
+              )
+            | list
+          }}
+
+    - name: Calculate ETA
+      set_fact:
+        total_versions: "{{ upgrade_versions | length }}"
+        estimated_time_minutes: "{{ (upgrade_versions | length) * avg_upgrade_minutes_per_version }}"
+
+    - debug:
+        msg:
+          - "Upgrade path detected:"
+          - "{{ upgrade_versions }}"
+          - "Estimated total upgrade time: {{ estimated_time_minutes }} minutes"
+
+    - name: Confirm upgrade start
+      pause:
+        prompt: "Proceed with GitLab upgrade? (Ctrl+C to abort)"
+
+    - name: Perform sequential GitLab upgrade
+      block:
+
+        - name: Install GitLab {{ item }}
+          apt:
+            name: "gitlab-ee={{ item }}-ee.0"
+            state: present
+            update_cache: yes
+
+        - name: Reconfigure GitLab
+          command: gitlab-ctl reconfigure
+
+        - name: Restart GitLab
+          command: gitlab-ctl restart
+
+        - name: Wait for GitLab health
+          uri:
+            url: http://127.0.0.1/-/health
+            status_code: 200
+          retries: 30
+          delay: 10
+          until: result.status == 200
+          register: result
+
+        - name: Show version after upgrade
+          command: gitlab-rake gitlab:env:info
+          register: version_info
+          changed_when: false
+
+        - debug:
+            var: version_info.stdout_lines
+
+      loop: "{{ upgrade_versions }}"
