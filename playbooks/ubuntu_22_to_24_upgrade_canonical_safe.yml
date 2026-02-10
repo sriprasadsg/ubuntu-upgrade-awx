@@ -1,0 +1,124 @@
+---
+- name: Ubuntu 22.04 → 24.04 Upgrade (Canonical Safe)
+  hosts: all
+  become: true
+  gather_facts: true
+  serial: 1
+
+  vars:
+    upgrade_cmd: /usr/bin/do-release-upgrade
+    log_dir: /var/log/awx-upgrade
+
+  tasks:
+    ####################################################################
+    # PRE-FLIGHT HARD BLOCKERS
+    ####################################################################
+    - name: Ensure Ubuntu 22.04
+      fail:
+        msg: "This playbook is for Ubuntu 22.04 only"
+      when: ansible_distribution != "Ubuntu" or ansible_distribution_version != "22.04"
+
+    - name: Ensure log directory exists
+      file:
+        path: "{{ log_dir }}"
+        state: directory
+        mode: '0755'
+
+    ####################################################################
+    # DISK SPACE CHECK (MANDATORY)
+    ####################################################################
+    - name: Check available disk space on /
+      shell: df -BG / | awk 'NR==2 {print $4}' | tr -d 'G'
+      register: disk_free
+      changed_when: false
+
+    - name: Fail if insufficient disk space
+      fail:
+        msg: "At least 20GB free disk space required for 24.04 upgrade"
+      when: disk_free.stdout | int < 20
+
+    ####################################################################
+    # CLEAN SYSTEM STATE
+    ####################################################################
+    - name: Unhold all held packages
+      shell: apt-mark unhold $(apt-mark showhold) || true
+      changed_when: false
+
+    - name: Disable third-party repositories
+      shell: |
+        sed -i 's/^deb /# deb /' /etc/apt/sources.list.d/*.list || true
+      changed_when: false
+
+    - name: Ensure release upgrader is latest
+      apt:
+        name: ubuntu-release-upgrader-core
+        state: latest
+        update_cache: yes
+
+    - name: Force correct LTS upgrade channel
+      copy:
+        dest: /etc/update-manager/release-upgrades
+        content: |
+          [DEFAULT]
+          Prompt=lts
+
+    ####################################################################
+    # FULL SYSTEM UPDATE (MANDATORY)
+    ####################################################################
+    - name: Full upgrade before OS upgrade
+      shell: |
+        apt-get update &&
+        apt-get -y full-upgrade
+      async: 7200
+      poll: 20
+
+    - name: Reboot if required after full upgrade
+      stat:
+        path: /var/run/reboot-required
+      register: reboot_required
+
+    - name: Reboot system
+      reboot:
+        reboot_timeout: 1800
+      when: reboot_required.stat.exists
+
+    - name: Refresh facts after reboot
+      setup:
+
+    ####################################################################
+    # VERIFY UPGRADE AVAILABILITY (CRITICAL)
+    ####################################################################
+    - name: Check if 24.04 upgrade is available
+      shell: do-release-upgrade -c
+      register: upgrade_check
+      changed_when: false
+
+    - name: Fail if upgrade not available
+      fail:
+        msg: "24.04 upgrade not available: {{ upgrade_check.stdout }}"
+      when: "'No new release found' in upgrade_check.stdout"
+
+    ####################################################################
+    # ACTUAL OS UPGRADE (WITH LOG STREAMING)
+    ####################################################################
+    - name: Upgrade Ubuntu 22.04 → 24.04 (LIVE)
+      shell: |
+        {{ upgrade_cmd }} -f DistUpgradeViewNonInteractive 2>&1 | tee {{ log_dir }}/os_upgrade_22_to_24.log
+      async: 14400
+      poll: 30
+
+    ####################################################################
+    # FINAL REBOOT & VALIDATION
+    ####################################################################
+    - name: Final reboot
+      reboot:
+        reboot_timeout: 1800
+
+    - name: Refresh facts
+      setup:
+
+    - name: Display final OS version
+      debug:
+        msg:
+          - "Final OS: {{ ansible_distribution }}"
+          - "Version: {{ ansible_distribution_version }}"
