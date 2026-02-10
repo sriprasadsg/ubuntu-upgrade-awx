@@ -1,5 +1,5 @@
 ---
-- name: Ubuntu OS Upgrade 20.04 → 22.04 → 24.04 (Hardened)
+- name: Ubuntu OS Upgrade 20.04 → 22.04 → 24.04 (Fully Hardened)
   hosts: all
   become: true
   gather_facts: true
@@ -7,6 +7,7 @@
 
   vars:
     upgrade_cmd: /usr/bin/do-release-upgrade
+    log_dir: /var/log/awx-upgrade
 
   tasks:
     ####################################################################
@@ -17,53 +18,81 @@
         msg: "This playbook supports Ubuntu only"
       when: ansible_distribution != "Ubuntu"
 
+    - name: Ensure log directory exists
+      file:
+        path: "{{ log_dir }}"
+        state: directory
+        mode: '0755'
+
     ####################################################################
-    # ENSURE REQUIRED TOOLS
+    # DISK SPACE ENFORCEMENT (REQUIRED FOR 24.04)
     ####################################################################
-    - name: Ensure upgrade utilities are installed
+    - name: Check free disk space on /
+      shell: df -BG / | awk 'NR==2 {print $4}' | tr -d 'G'
+      register: disk_free
+      changed_when: false
+
+    - name: Fail if disk space is insufficient
+      fail:
+        msg: "At least 20GB free disk space is required for Ubuntu upgrade"
+      when: disk_free.stdout | int < 20
+
+    ####################################################################
+    # COMMON PRE-UPGRADE HARDENING
+    ####################################################################
+    - name: Unhold all held packages
+      shell: apt-mark unhold $(apt-mark showhold) || true
+      changed_when: false
+
+    - name: Disable third-party repositories
+      shell: |
+        sed -i 's/^deb /# deb /' /etc/apt/sources.list.d/*.list || true
+      changed_when: false
+
+    - name: Ensure upgrade tools are installed and updated
       apt:
         name:
           - ubuntu-release-upgrader-core
           - update-manager-core
-        state: present
+        state: latest
         update_cache: yes
 
-    - name: Ensure LTS upgrades are enabled
-      lineinfile:
-        path: /etc/update-manager/release-upgrades
-        regexp: '^Prompt='
-        line: 'Prompt=lts'
+    - name: Ensure LTS upgrade channel
+      copy:
+        dest: /etc/update-manager/release-upgrades
+        content: |
+          [DEFAULT]
+          Prompt=lts
 
     ####################################################################
-    # ALWAYS ENFORCE CLEAN STATE BEFORE ANY OS UPGRADE
+    # ENFORCE CLEAN STATE (MANDATORY)
     ####################################################################
-    - name: Enforce fully updated system before OS upgrade
+    - name: Enforce full system upgrade
       shell: |
         apt-get update &&
         apt-get -y full-upgrade
-      args:
-        executable: /bin/bash
       async: 7200
       poll: 20
 
-    - name: Check if reboot required after full upgrade
+    - name: Reboot if required after package upgrade
       stat:
         path: /var/run/reboot-required
-      register: reboot_required_pre
+      register: reboot_required
 
-    - name: Reboot if required before OS upgrade
+    - name: Reboot system if required
       reboot:
         reboot_timeout: 1800
-      when: reboot_required_pre.stat.exists
+      when: reboot_required.stat.exists
 
-    - name: Refresh facts after pre-upgrade reboot
+    - name: Refresh facts after reboot
       setup:
 
     ####################################################################
     # 20.04 → 22.04
     ####################################################################
     - name: Upgrade Ubuntu 20.04 → 22.04
-      command: "{{ upgrade_cmd }} -f DistUpgradeViewNonInteractive"
+      shell: |
+        {{ upgrade_cmd }} -f DistUpgradeViewNonInteractive 2>&1 | tee {{ log_dir }}/os_upgrade_20_to_22.log
       async: 14400
       poll: 30
       when: ansible_distribution_version == "20.04"
@@ -77,40 +106,27 @@
       setup:
 
     ####################################################################
-    # ENFORCE CLEAN STATE BEFORE 22.04 → 24.04  (CRITICAL FIX)
+    # VERIFY 22.04 → 24.04 IS ALLOWED
     ####################################################################
-    - name: Ensure system fully updated before 22.04 → 24.04
-      shell: |
-        apt-get update &&
-        apt-get -y full-upgrade
-      args:
-        executable: /bin/bash
-      async: 7200
-      poll: 20
+    - name: Check if 24.04 upgrade is available
+      shell: do-release-upgrade -c
+      register: upgrade_check
+      changed_when: false
       when: ansible_distribution_version == "22.04"
 
-    - name: Check reboot required before 24.04 upgrade
-      stat:
-        path: /var/run/reboot-required
-      register: reboot_required_22
-      when: ansible_distribution_version == "22.04"
-
-    - name: Reboot before 24.04 upgrade (if required)
-      reboot:
-        reboot_timeout: 1800
+    - name: Fail if 24.04 upgrade is not available
+      fail:
+        msg: "24.04 upgrade blocked by Ubuntu policy: {{ upgrade_check.stdout }}"
       when:
         - ansible_distribution_version == "22.04"
-        - reboot_required_22.stat.exists
-
-    - name: Refresh facts after pre-24.04 reboot
-      setup:
-      when: ansible_distribution_version == "22.04"
+        - "'No new release found' in upgrade_check.stdout"
 
     ####################################################################
     # 22.04 → 24.04
     ####################################################################
     - name: Upgrade Ubuntu 22.04 → 24.04
-      command: "{{ upgrade_cmd }} -f DistUpgradeViewNonInteractive"
+      shell: |
+        {{ upgrade_cmd }} -f DistUpgradeViewNonInteractive 2>&1 | tee {{ log_dir }}/os_upgrade_22_to_24.log
       async: 14400
       poll: 30
       when: ansible_distribution_version == "22.04"
