@@ -1,0 +1,180 @@
+---
+- name: Ubuntu OS Upgrade 18.04 → 20.04 → 22.04 → 24.04 (Fully Hardened)
+  hosts: all
+  become: true
+  gather_facts: true
+  serial: 1
+
+  vars:
+    upgrade_cmd: /usr/bin/do-release-upgrade
+    log_dir: /var/log/awx-upgrade
+    min_disk_gb: 20
+
+  tasks:
+    ####################################################################
+    # SAFETY CHECK
+    ####################################################################
+    - name: Ensure system is Ubuntu
+      fail:
+        msg: "This playbook supports Ubuntu only"
+      when: ansible_distribution != "Ubuntu"
+
+    - name: Ensure log directory exists
+      file:
+        path: "{{ log_dir }}"
+        state: directory
+        mode: '0755'
+
+    ####################################################################
+    # ENSURE do-release-upgrade EXISTS
+    ####################################################################
+    - name: Install Ubuntu release upgrader
+      apt:
+        name:
+          - ubuntu-release-upgrader-core
+          - update-manager-core
+        state: latest
+        update_cache: yes
+
+    - name: Verify do-release-upgrade binary exists
+      stat:
+        path: "{{ upgrade_cmd }}"
+      register: upgrader_bin
+
+    - name: Fail if do-release-upgrade is missing
+      fail:
+        msg: "do-release-upgrade not found at {{ upgrade_cmd }}"
+      when: not upgrader_bin.stat.exists
+
+    ####################################################################
+    # DISK SPACE ENFORCEMENT
+    ####################################################################
+    - name: Check free disk space on /
+      shell: df -BG / | awk 'NR==2 {print $4}' | tr -d 'G'
+      register: disk_free
+      changed_when: false
+
+    - name: Fail if insufficient disk space
+      fail:
+        msg: "At least {{ min_disk_gb }}GB free disk space required"
+      when: disk_free.stdout | int < min_disk_gb
+
+    ####################################################################
+    # PRE-UPGRADE HARDENING (COMMON)
+    ####################################################################
+    - name: Unhold all held packages
+      shell: apt-mark unhold $(apt-mark showhold) || true
+      changed_when: false
+
+    - name: Disable third-party repositories
+      shell: sed -i 's/^deb /# deb /' /etc/apt/sources.list.d/*.list || true
+      changed_when: false
+
+    - name: Force LTS upgrade channel
+      copy:
+        dest: /etc/update-manager/release-upgrades
+        content: |
+          [DEFAULT]
+          Prompt=lts
+
+    ####################################################################
+    # ENFORCE CLEAN STATE BEFORE ANY OS JUMP
+    ####################################################################
+    - name: Full system upgrade before OS upgrade
+      shell: |
+        apt-get update &&
+        apt-get -y full-upgrade
+      async: 7200
+      poll: 20
+
+    - name: Reboot if required after package upgrade
+      stat:
+        path: /var/run/reboot-required
+      register: reboot_required
+
+    - name: Reboot system if required
+      reboot:
+        reboot_timeout: 1800
+      when: reboot_required.stat.exists
+
+    - name: Refresh facts
+      setup:
+
+    ####################################################################
+    # 18.04 → 20.04
+    ####################################################################
+    - name: Upgrade Ubuntu 18.04 → 20.04
+      shell: |
+        {{ upgrade_cmd }} -f DistUpgradeViewNonInteractive 2>&1 | tee {{ log_dir }}/os_upgrade_18_to_20.log
+      async: 14400
+      poll: 30
+      when: ansible_distribution_version == "18.04"
+
+    - name: Reboot after 20.04 upgrade
+      reboot:
+        reboot_timeout: 1800
+      when: ansible_distribution_version == "18.04"
+
+    - name: Refresh facts after 20.04 upgrade
+      setup:
+
+    ####################################################################
+    # 20.04 → 22.04
+    ####################################################################
+    - name: Upgrade Ubuntu 20.04 → 22.04
+      shell: |
+        {{ upgrade_cmd }} -f DistUpgradeViewNonInteractive 2>&1 | tee {{ log_dir }}/os_upgrade_20_to_22.log
+      async: 14400
+      poll: 30
+      when: ansible_distribution_version == "20.04"
+
+    - name: Reboot after 22.04 upgrade
+      reboot:
+        reboot_timeout: 1800
+      when: ansible_distribution_version == "20.04"
+
+    - name: Refresh facts after 22.04 upgrade
+      setup:
+
+    ####################################################################
+    # VERIFY 22.04 → 24.04 IS AVAILABLE
+    ####################################################################
+    - name: Check if 24.04 upgrade is available
+      shell: "{{ upgrade_cmd }} -c"
+      register: upgrade_check
+      changed_when: false
+      when: ansible_distribution_version == "22.04"
+
+    - name: Fail if 24.04 upgrade is blocked
+      fail:
+        msg: "Ubuntu policy blocked 24.04 upgrade: {{ upgrade_check.stdout }}"
+      when:
+        - ansible_distribution_version == "22.04"
+        - "'No new release found' in upgrade_check.stdout"
+
+    ####################################################################
+    # 22.04 → 24.04
+    ####################################################################
+    - name: Upgrade Ubuntu 22.04 → 24.04
+      shell: |
+        {{ upgrade_cmd }} -f DistUpgradeViewNonInteractive 2>&1 | tee {{ log_dir }}/os_upgrade_22_to_24.log
+      async: 14400
+      poll: 30
+      when: ansible_distribution_version == "22.04"
+
+    - name: Final reboot after 24.04 upgrade
+      reboot:
+        reboot_timeout: 1800
+      when: ansible_distribution_version == "22.04"
+
+    ####################################################################
+    # FINAL VALIDATION
+    ####################################################################
+    - name: Refresh facts after final reboot
+      setup:
+
+    - name: Display final OS version
+      debug:
+        msg:
+          - "Final OS: {{ ansible_distribution }}"
+          - "Version: {{ ansible_distribution_version }}"
