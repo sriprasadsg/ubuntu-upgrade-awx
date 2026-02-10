@@ -1,0 +1,134 @@
+---
+- name: Ubuntu 18 → 20 → 22 → 24 Upgrade (NO REBOOT MODE)
+  hosts: all
+  become: true
+  gather_facts: true
+  serial: 1
+
+  vars:
+    upgrade_cmd: /usr/bin/do-release-upgrade
+    log_dir: /var/log/awx-upgrade
+    min_disk_gb: 20
+
+  tasks:
+    ####################################################################
+    # SAFETY CHECK
+    ####################################################################
+    - name: Ensure system is Ubuntu
+      fail:
+        msg: "This playbook supports Ubuntu only"
+      when: ansible_distribution != "Ubuntu"
+
+    - name: Ensure log directory exists
+      file:
+        path: "{{ log_dir }}"
+        state: directory
+        mode: '0755'
+
+    ####################################################################
+    # ENSURE do-release-upgrade EXISTS
+    ####################################################################
+    - name: Install Ubuntu release upgrader
+      apt:
+        name:
+          - ubuntu-release-upgrader-core
+          - update-manager-core
+        state: latest
+        update_cache: yes
+
+    - name: Verify do-release-upgrade exists
+      stat:
+        path: "{{ upgrade_cmd }}"
+      register: upgrader_bin
+
+    - name: Fail if do-release-upgrade missing
+      fail:
+        msg: "do-release-upgrade not found"
+      when: not upgrader_bin.stat.exists
+
+    ####################################################################
+    # DISK SPACE ENFORCEMENT
+    ####################################################################
+    - name: Check free disk space on /
+      shell: df -BG / | awk 'NR==2 {print $4}' | tr -d 'G'
+      register: disk_free
+      changed_when: false
+
+    - name: Fail if insufficient disk space
+      fail:
+        msg: "At least {{ min_disk_gb }}GB free disk space required"
+      when: disk_free.stdout | int < min_disk_gb
+
+    ####################################################################
+    # PRE-UPGRADE HARDENING (SAFE)
+    ####################################################################
+    - name: Unhold all held packages
+      shell: apt-mark unhold $(apt-mark showhold) || true
+      changed_when: false
+
+    - name: Disable third-party repositories
+      shell: sed -i 's/^deb /# deb /' /etc/apt/sources.list.d/*.list || true
+      changed_when: false
+
+    - name: Force LTS upgrade channel
+      copy:
+        dest: /etc/update-manager/release-upgrades
+        content: |
+          [DEFAULT]
+          Prompt=lts
+
+    ####################################################################
+    # APPLICATION + SECURITY UPDATES (NO REBOOT)
+    ####################################################################
+    - name: Update apt cache
+      shell: apt-get update 2>&1 | tee {{ log_dir }}/apt_update.log
+      args:
+        executable: /bin/bash
+
+    - name: Apply all available updates (no reboot)
+      shell: |
+        apt-get -y full-upgrade 2>&1 | tee {{ log_dir }}/full_upgrade.log
+      args:
+        executable: /bin/bash
+      async: 7200
+      poll: 20
+
+    ####################################################################
+    # CHECK IF REBOOT IS REQUIRED (DO NOT REBOOT)
+    ####################################################################
+    - name: Check if reboot is required
+      stat:
+        path: /var/run/reboot-required
+      register: reboot_required
+
+    - name: Warn if reboot is required
+      debug:
+        msg: |
+          Reboot is REQUIRED to complete updates.
+          OS upgrade will NOT proceed without reboot.
+      when: reboot_required.stat.exists
+
+    ####################################################################
+    # OS UPGRADE CHECKS ONLY (NO EXECUTION)
+    ####################################################################
+    - name: Check OS upgrade availability (dry-run)
+      shell: "{{ upgrade_cmd }} -c"
+      register: upgrade_check
+      changed_when: false
+
+    - name: Display OS upgrade readiness
+      debug:
+        msg:
+          - "Current OS: {{ ansible_distribution_version }}"
+          - "{{ upgrade_check.stdout }}"
+
+    ####################################################################
+    # FINAL STATUS
+    ####################################################################
+    - name: Final summary
+      debug:
+        msg:
+          - "All safe updates applied without reboot"
+          - "OS upgrade prepared but NOT executed"
+          - "Manual reboot required to proceed with OS upgrade"
+          - "Logs stored in {{ log_dir }}"
