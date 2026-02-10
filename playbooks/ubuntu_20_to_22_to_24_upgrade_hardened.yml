@@ -1,0 +1,133 @@
+---
+- name: Ubuntu OS Upgrade 20.04 → 22.04 → 24.04 (Hardened)
+  hosts: all
+  become: true
+  gather_facts: true
+  serial: 1
+
+  vars:
+    upgrade_cmd: /usr/bin/do-release-upgrade
+
+  tasks:
+    ####################################################################
+    # SAFETY CHECK
+    ####################################################################
+    - name: Ensure system is Ubuntu
+      fail:
+        msg: "This playbook supports Ubuntu only"
+      when: ansible_distribution != "Ubuntu"
+
+    ####################################################################
+    # ENSURE REQUIRED TOOLS
+    ####################################################################
+    - name: Ensure upgrade utilities are installed
+      apt:
+        name:
+          - ubuntu-release-upgrader-core
+          - update-manager-core
+        state: present
+        update_cache: yes
+
+    - name: Ensure LTS upgrades are enabled
+      lineinfile:
+        path: /etc/update-manager/release-upgrades
+        regexp: '^Prompt='
+        line: 'Prompt=lts'
+
+    ####################################################################
+    # ALWAYS ENFORCE CLEAN STATE BEFORE ANY OS UPGRADE
+    ####################################################################
+    - name: Enforce fully updated system before OS upgrade
+      shell: |
+        apt-get update &&
+        apt-get -y full-upgrade
+      args:
+        executable: /bin/bash
+      async: 7200
+      poll: 20
+
+    - name: Check if reboot required after full upgrade
+      stat:
+        path: /var/run/reboot-required
+      register: reboot_required_pre
+
+    - name: Reboot if required before OS upgrade
+      reboot:
+        reboot_timeout: 1800
+      when: reboot_required_pre.stat.exists
+
+    - name: Refresh facts after pre-upgrade reboot
+      setup:
+
+    ####################################################################
+    # 20.04 → 22.04
+    ####################################################################
+    - name: Upgrade Ubuntu 20.04 → 22.04
+      command: "{{ upgrade_cmd }} -f DistUpgradeViewNonInteractive"
+      async: 14400
+      poll: 30
+      when: ansible_distribution_version == "20.04"
+
+    - name: Reboot after 22.04 upgrade
+      reboot:
+        reboot_timeout: 1800
+      when: ansible_distribution_version == "20.04"
+
+    - name: Refresh facts after 22.04 upgrade
+      setup:
+
+    ####################################################################
+    # ENFORCE CLEAN STATE BEFORE 22.04 → 24.04  (CRITICAL FIX)
+    ####################################################################
+    - name: Ensure system fully updated before 22.04 → 24.04
+      shell: |
+        apt-get update &&
+        apt-get -y full-upgrade
+      args:
+        executable: /bin/bash
+      async: 7200
+      poll: 20
+      when: ansible_distribution_version == "22.04"
+
+    - name: Check reboot required before 24.04 upgrade
+      stat:
+        path: /var/run/reboot-required
+      register: reboot_required_22
+      when: ansible_distribution_version == "22.04"
+
+    - name: Reboot before 24.04 upgrade (if required)
+      reboot:
+        reboot_timeout: 1800
+      when:
+        - ansible_distribution_version == "22.04"
+        - reboot_required_22.stat.exists
+
+    - name: Refresh facts after pre-24.04 reboot
+      setup:
+      when: ansible_distribution_version == "22.04"
+
+    ####################################################################
+    # 22.04 → 24.04
+    ####################################################################
+    - name: Upgrade Ubuntu 22.04 → 24.04
+      command: "{{ upgrade_cmd }} -f DistUpgradeViewNonInteractive"
+      async: 14400
+      poll: 30
+      when: ansible_distribution_version == "22.04"
+
+    - name: Final reboot after 24.04 upgrade
+      reboot:
+        reboot_timeout: 1800
+      when: ansible_distribution_version == "22.04"
+
+    ####################################################################
+    # FINAL VALIDATION
+    ####################################################################
+    - name: Refresh facts after final reboot
+      setup:
+
+    - name: Display final OS version
+      debug:
+        msg:
+          - "Final OS: {{ ansible_distribution }}"
+          - "Version: {{ ansible_distribution_version }}"
