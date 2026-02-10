@@ -1,5 +1,5 @@
 ---
-- name: Ubuntu OS Upgrade 20.04 → 22.04 → 24.04 (Fully Hardened)
+- name: Ubuntu OS Upgrade 20.04 → 22.04 → 24.04 (Fully Hardened & Verified)
   hosts: all
   become: true
   gather_facts: true
@@ -25,7 +25,28 @@
         mode: '0755'
 
     ####################################################################
-    # DISK SPACE ENFORCEMENT (REQUIRED FOR 24.04)
+    # ENSURE do-release-upgrade EXISTS (CRITICAL FIX)
+    ####################################################################
+    - name: Install Ubuntu release upgrader (required)
+      apt:
+        name:
+          - ubuntu-release-upgrader-core
+          - update-manager-core
+        state: latest
+        update_cache: yes
+
+    - name: Verify do-release-upgrade binary exists
+      stat:
+        path: "{{ upgrade_cmd }}"
+      register: upgrader_binary
+
+    - name: Fail if do-release-upgrade is missing
+      fail:
+        msg: "do-release-upgrade not found at {{ upgrade_cmd }}"
+      when: not upgrader_binary.stat.exists
+
+    ####################################################################
+    # DISK SPACE ENFORCEMENT
     ####################################################################
     - name: Check free disk space on /
       shell: df -BG / | awk 'NR==2 {print $4}' | tr -d 'G'
@@ -38,7 +59,7 @@
       when: disk_free.stdout | int < 20
 
     ####################################################################
-    # COMMON PRE-UPGRADE HARDENING
+    # PRE-UPGRADE HARDENING
     ####################################################################
     - name: Unhold all held packages
       shell: apt-mark unhold $(apt-mark showhold) || true
@@ -49,15 +70,7 @@
         sed -i 's/^deb /# deb /' /etc/apt/sources.list.d/*.list || true
       changed_when: false
 
-    - name: Ensure upgrade tools are installed and updated
-      apt:
-        name:
-          - ubuntu-release-upgrader-core
-          - update-manager-core
-        state: latest
-        update_cache: yes
-
-    - name: Ensure LTS upgrade channel
+    - name: Force LTS upgrade channel
       copy:
         dest: /etc/update-manager/release-upgrades
         content: |
@@ -65,7 +78,7 @@
           Prompt=lts
 
     ####################################################################
-    # ENFORCE CLEAN STATE (MANDATORY)
+    # ENFORCE CLEAN SYSTEM STATE
     ####################################################################
     - name: Enforce full system upgrade
       shell: |
@@ -106,17 +119,17 @@
       setup:
 
     ####################################################################
-    # VERIFY 22.04 → 24.04 IS ALLOWED
+    # VERIFY 22.04 → 24.04 IS AVAILABLE
     ####################################################################
     - name: Check if 24.04 upgrade is available
-      shell: do-release-upgrade -c
+      shell: "{{ upgrade_cmd }} -c"
       register: upgrade_check
       changed_when: false
       when: ansible_distribution_version == "22.04"
 
-    - name: Fail if 24.04 upgrade is not available
+    - name: Fail if 24.04 upgrade is blocked
       fail:
-        msg: "24.04 upgrade blocked by Ubuntu policy: {{ upgrade_check.stdout }}"
+        msg: "Ubuntu policy blocked 24.04 upgrade: {{ upgrade_check.stdout }}"
       when:
         - ansible_distribution_version == "22.04"
         - "'No new release found' in upgrade_check.stdout"
