@@ -1,0 +1,104 @@
+---
+- name: Ubuntu OS Upgrade 20.04 → 22.04 → 24.04
+  hosts: all
+  become: true
+  gather_facts: true
+  serial: 1
+
+  vars:
+    upgrade_cmd: /usr/bin/do-release-upgrade
+
+  tasks:
+    ####################################################################
+    # SAFETY CHECK
+    ####################################################################
+    - name: Ensure system is Ubuntu
+      fail:
+        msg: "This playbook supports Ubuntu only"
+      when: ansible_distribution != "Ubuntu"
+
+    ####################################################################
+    # ENSURE REQUIRED TOOLS
+    ####################################################################
+    - name: Ensure upgrade utilities are installed
+      apt:
+        name:
+          - ubuntu-release-upgrader-core
+          - update-manager-core
+        state: present
+        update_cache: yes
+
+    - name: Ensure LTS upgrades are enabled
+      lineinfile:
+        path: /etc/update-manager/release-upgrades
+        regexp: '^Prompt='
+        line: 'Prompt=lts'
+
+    ####################################################################
+    # PRE-UPGRADE FULL UPDATE (MANDATORY)
+    ####################################################################
+    - name: Update apt cache
+      apt:
+        update_cache: yes
+        cache_valid_time: 3600
+
+    - name: Fully upgrade existing packages
+      apt:
+        upgrade: full
+        dpkg_options: "force-confdef,force-confold"
+
+    - name: Check if reboot required before OS upgrade
+      stat:
+        path: /var/run/reboot-required
+      register: reboot_pre
+
+    - name: Reboot if required (pre-upgrade)
+      reboot:
+        reboot_timeout: 1800
+      when: reboot_pre.stat.exists
+
+    - name: Refresh facts
+      setup:
+
+    ####################################################################
+    # 20.04 → 22.04
+    ####################################################################
+    - name: Upgrade Ubuntu 20.04 → 22.04
+      command: "{{ upgrade_cmd }} -f DistUpgradeViewNonInteractive"
+      async: 14400
+      poll: 30
+      when: ansible_distribution_version == "20.04"
+
+    - name: Reboot after 22.04 upgrade
+      reboot:
+        reboot_timeout: 1800
+      when: ansible_distribution_version == "20.04"
+
+    - name: Refresh facts after 22.04 upgrade
+      setup:
+
+    ####################################################################
+    # 22.04 → 24.04
+    ####################################################################
+    - name: Upgrade Ubuntu 22.04 → 24.04
+      command: "{{ upgrade_cmd }} -f DistUpgradeViewNonInteractive"
+      async: 14400
+      poll: 30
+      when: ansible_distribution_version == "22.04"
+
+    - name: Final reboot after 24.04 upgrade
+      reboot:
+        reboot_timeout: 1800
+      when: ansible_distribution_version == "22.04"
+
+    ####################################################################
+    # FINAL VALIDATION
+    ####################################################################
+    - name: Refresh facts after final reboot
+      setup:
+
+    - name: Display final OS version
+      debug:
+        msg:
+          - "Final OS: {{ ansible_distribution }}"
+          - "Version: {{ ansible_distribution_version }}"
