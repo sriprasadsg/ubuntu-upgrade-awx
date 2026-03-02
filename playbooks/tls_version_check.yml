@@ -1,0 +1,38 @@
+---
+- name: TLS Version Detection on Servers
+  hosts: tls_targets
+  gather_facts: no
+  vars:
+    tls_port: 443
+    tls_versions:
+      - name: TLSv1.0
+        flag: "-tls1"
+      - name: TLSv1.1
+        flag: "-tls1_1"
+      - name: TLSv1.2
+        flag: "-tls1_2"
+      - name: TLSv1.3
+        flag: "-tls1_3"
+
+  tasks:
+
+    - name: Check TLS versions using OpenSSL
+      shell: |
+        echo | openssl s_client -connect {{ inventory_hostname }}:{{ tls_port }} {{ item.flag }} 2>/dev/null | grep -E "Protocol|Cipher"
+      register: tls_test_results
+      loop: "{{ tls_versions }}"
+      ignore_errors: yes
+
+    - name: Display TLS version status
+      debug:
+        msg: |
+          ===== TLS Scan Result for {{ inventory_hostname }} =====
+          {% for result in tls_test_results.results %}
+          {{ tls_versions[loop.index0].name }}:
+          {% if result.rc == 0 and result.stdout != "" %}
+            ✅ ENABLED
+            {{ result.stdout }}
+          {% else %}
+            ❌ NOT ENABLED
+          {% endif %}
+          {% endfor %}
