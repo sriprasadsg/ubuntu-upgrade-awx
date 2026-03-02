@@ -1,0 +1,156 @@
+---
+- name: Universal TLS 1.3 Detection and Enforcement
+  hosts: all
+  become: yes
+  gather_facts: yes
+
+  vars:
+    tls_port: 443
+    tls_timeout: 5
+
+  tasks:
+
+  # --------------------------------------------------
+  # 1. Validate OpenSSL supports TLS 1.3
+  # --------------------------------------------------
+  - name: Get OpenSSL version
+    command: openssl version
+    register: openssl_version
+    changed_when: false
+
+  - name: Fail if OpenSSL does not support TLS 1.3
+    fail:
+      msg: "OpenSSL does not support TLS 1.3: {{ openssl_version.stdout }}"
+    when: openssl_version.stdout is not search('1.1.1|3.')
+
+  # --------------------------------------------------
+  # 2. Test current TLS 1.3 status
+  # --------------------------------------------------
+  - name: Test TLS 1.3 handshake
+    shell: >
+      echo | timeout {{ tls_timeout }}
+      openssl s_client -connect localhost:{{ tls_port }} -tls1_3
+      2>/dev/null | grep Protocol
+    register: tls13_test
+    ignore_errors: yes
+    changed_when: false
+
+  - name: Set TLS 1.3 status
+    set_fact:
+      tls13_enabled: "{{ 'TLSv1.3' in tls13_test.stdout }}"
+
+  - name: Report TLS 1.3 status
+    debug:
+      msg: "TLS 1.3 enabled on {{ inventory_hostname }}: {{ tls13_enabled }}"
+
+  # --------------------------------------------------
+  # 3. Detect running services
+  # --------------------------------------------------
+  - name: Gather running services
+    service_facts:
+
+  - name: Detect known TLS services
+    set_fact:
+      has_nginx: "{{ 'nginx.service' in ansible_facts.services }}"
+      has_apache: "{{ 'apache2.service' in ansible_facts.services }}"
+      has_haproxy: "{{ 'haproxy.service' in ansible_facts.services }}"
+
+  - name: Show detected services
+    debug:
+      msg:
+        nginx: "{{ has_nginx }}"
+        apache: "{{ has_apache }}"
+        haproxy: "{{ has_haproxy }}"
+
+  # --------------------------------------------------
+  # 4. Enable TLS 1.3 for NGINX
+  # --------------------------------------------------
+  - block:
+      - name: Ensure NGINX TLS config exists
+        copy:
+          dest: /etc/nginx/snippets/tls13.conf
+          owner: root
+          group: root
+          mode: '0644'
+          content: |
+            ssl_protocols TLSv1.2 TLSv1.3;
+            ssl_prefer_server_ciphers off;
+        notify: reload nginx
+
+      - name: Include TLS config in NGINX sites
+        lineinfile:
+          path: "{{ item }}"
+          insertafter: 'listen 443 ssl'
+          line: 'include /etc/nginx/snippets/tls13.conf;'
+          state: present
+        with_fileglob:
+          - /etc/nginx/sites-enabled/*
+        notify: reload nginx
+    when:
+      - not tls13_enabled
+      - has_nginx
+
+  # --------------------------------------------------
+  # 5. Enable TLS 1.3 for Apache
+  # --------------------------------------------------
+  - block:
+      - name: Enable Apache SSL module
+        command: a2enmod ssl
+        args:
+          creates: /etc/apache2/mods-enabled/ssl.load
+
+      - name: Configure Apache SSLProtocol
+        lineinfile:
+          path: /etc/apache2/mods-available/ssl.conf
+          regexp: '^SSLProtocol'
+          line: 'SSLProtocol all -TLSv1 -TLSv1.1'
+        notify: reload apache
+    when:
+      - not tls13_enabled
+      - has_apache
+
+  # --------------------------------------------------
+  # 6. Enable TLS 1.3 for HAProxy
+  # --------------------------------------------------
+  - block:
+      - name: Configure HAProxy TLS defaults
+        lineinfile:
+          path: /etc/haproxy/haproxy.cfg
+          regexp: '^ssl-default-bind-options'
+          line: 'ssl-default-bind-options ssl-min-ver TLSv1.2'
+        notify: reload haproxy
+    when:
+      - not tls13_enabled
+      - has_haproxy
+
+  # --------------------------------------------------
+  # 7. Re-verify TLS 1.3
+  # --------------------------------------------------
+  - name: Verify TLS 1.3 after enforcement
+    shell: >
+      echo | timeout {{ tls_timeout }}
+      openssl s_client -connect localhost:{{ tls_port }} -tls1_3
+      2>/dev/null | grep Protocol
+    register: tls13_verify
+    ignore_errors: yes
+    changed_when: false
+
+  - name: Final TLS 1.3 verification result
+    debug:
+      msg: "{{ tls13_verify.stdout | default('TLS 1.3 NOT enabled or service not on port 443') }}"
+
+  handlers:
+    - name: reload nginx
+      service:
+        name: nginx
+        state: reloaded
+
+    - name: reload apache
+      service:
+        name: apache2
+        state: reloaded
+
+    - name: reload haproxy
+      service:
+        name: haproxy
+        state: reloaded
