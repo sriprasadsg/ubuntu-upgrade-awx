@@ -1,0 +1,41 @@
+---
+- name: Configure System Proxy on Linux Servers
+  hosts: all
+  become: true
+
+  vars:
+    proxy_server: "http://192.168.10.95:3128"
+    no_proxy_list: "localhost,127.0.0.1,::1,192.168.10.0/24"
+
+  tasks:
+
+    - name: Configure system proxy in /etc/environment
+      copy:
+        dest: /etc/environment
+        content: |
+          http_proxy="{{ proxy_server }}"
+          https_proxy="{{ proxy_server }}"
+          ftp_proxy="{{ proxy_server }}"
+          no_proxy="{{ no_proxy_list }}"
+          HTTP_PROXY="{{ proxy_server }}"
+          HTTPS_PROXY="{{ proxy_server }}"
+          FTP_PROXY="{{ proxy_server }}"
+          NO_PROXY="{{ no_proxy_list }}"
+        owner: root
+        group: root
+        mode: '0644'
+
+    - name: Configure APT proxy
+      copy:
+        dest: /etc/apt/apt.conf.d/95proxies
+        content: |
+          Acquire::http::Proxy "{{ proxy_server }}";
+          Acquire::https::Proxy "{{ proxy_server }}";
+          Acquire::ftp::Proxy "{{ proxy_server }}";
+        owner: root
+        group: root
+        mode: '0644'
+
+    - name: Update apt cache
+      apt:
+        update_cache: yes
