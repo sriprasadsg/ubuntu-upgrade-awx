@@ -1,0 +1,54 @@
+---
+- name: Linux Patch Management with Retry
+  hosts: all
+  become: yes
+  gather_facts: yes
+
+  vars:
+    retry_packages: []
+
+  tasks:
+
+  - name: Update apt repository cache
+    apt:
+      update_cache: yes
+      cache_valid_time: 3600
+
+  - name: Run initial upgrade
+    shell: apt-get upgrade -y
+    register: upgrade_output
+
+  - name: Show upgrade result
+    debug:
+      var: upgrade_output.stdout
+
+  - name: Check for packages not upgraded
+    shell: apt list --upgradable 2>/dev/null | tail -n +2 | awk -F/ '{print $1}'
+    register: pending_packages
+
+  - name: Store packages needing upgrade
+    set_fact:
+      retry_packages: "{{ pending_packages.stdout_lines }}"
+
+  - name: Display pending packages
+    debug:
+      msg: "Packages pending upgrade: {{ retry_packages }}"
+
+  - name: Install remaining packages
+    apt:
+      name: "{{ retry_packages }}"
+      state: latest
+    when: retry_packages | length > 0
+
+  - name: Run upgrade again after installing pending packages
+    shell: apt-get upgrade -y
+    register: final_upgrade
+
+  - name: Show final upgrade status
+    debug:
+      var: final_upgrade.stdout
+
+  - name: Clean unused packages
+    apt:
+      autoremove: yes
+      autoclean: yes
