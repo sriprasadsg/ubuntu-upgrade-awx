@@ -1,5 +1,5 @@
 ---
-- name: Configure System Proxy on Linux Servers
+- name: Configure and Validate Proxy on Linux Servers
   hosts: all
   become: true
 
@@ -9,7 +9,23 @@
 
   tasks:
 
-    - name: Configure system proxy in /etc/environment
+    - name: Check if proxy already exists in /etc/environment
+      shell: grep -i http_proxy /etc/environment
+      register: proxy_check
+      ignore_errors: yes
+
+    - name: Test proxy connectivity
+      shell: curl -I -x {{ proxy_server }} https://www.google.com --max-time 10
+      register: proxy_test
+      ignore_errors: yes
+      when: proxy_check.rc == 0
+
+    - name: Display proxy working status
+      debug:
+        msg: "Proxy is already configured correctly and working fine."
+      when: proxy_check.rc == 0 and proxy_test.rc == 0
+
+    - name: Configure system proxy in /etc/environment if not present
       copy:
         dest: /etc/environment
         content: |
@@ -24,6 +40,7 @@
         owner: root
         group: root
         mode: '0644'
+      when: proxy_check.rc != 0 or proxy_test.rc != 0
 
     - name: Configure APT proxy
       copy:
@@ -35,6 +52,7 @@
         owner: root
         group: root
         mode: '0644'
+      when: proxy_check.rc != 0 or proxy_test.rc != 0
 
     - name: Update apt cache
       apt:
