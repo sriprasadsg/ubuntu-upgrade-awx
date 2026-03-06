@@ -1,5 +1,5 @@
 ---
-- name: Remove System Proxy Configuration
+- name: Remove Proxy Configuration and Validate
   hosts: all
   become: true
 
@@ -16,17 +16,50 @@
 
   tasks:
 
+    - name: Check if proxy exists in /etc/environment
+      shell: grep -Ei 'http_proxy|https_proxy' /etc/environment
+      register: proxy_exists
+      ignore_errors: yes
+
     - name: Remove proxy variables from /etc/environment
       lineinfile:
         path: /etc/environment
         regexp: "^{{ item }}="
         state: absent
       loop: "{{ proxy_env_vars }}"
+      when: proxy_exists.rc == 0
 
     - name: Remove APT proxy configuration
       file:
         path: /etc/apt/apt.conf.d/95proxies
         state: absent
+      when: proxy_exists.rc == 0
+
+    - name: Reload environment variables
+      shell: source /etc/environment
+      args:
+        executable: /bin/bash
+      ignore_errors: yes
+
+    - name: Verify proxy variables removed
+      shell: grep -Ei 'http_proxy|https_proxy' /etc/environment
+      register: proxy_verify
+      ignore_errors: yes
+
+    - name: Test internet connectivity without proxy
+      shell: curl -I https://www.google.com --max-time 10
+      register: internet_test
+      ignore_errors: yes
+
+    - name: Display proxy removal status
+      debug:
+        msg: "Proxy configuration removed successfully and internet is working without proxy."
+      when: proxy_verify.rc != 0 and internet_test.rc == 0
+
+    - name: Display proxy removal failed message
+      debug:
+        msg: "Proxy configuration removal completed but internet connectivity needs verification."
+      when: proxy_verify.rc != 0 and internet_test.rc != 0
 
     - name: Update apt cache
       apt:
