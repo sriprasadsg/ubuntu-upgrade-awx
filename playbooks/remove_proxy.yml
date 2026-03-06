@@ -1,0 +1,33 @@
+---
+- name: Remove System Proxy Configuration
+  hosts: all
+  become: true
+
+  vars:
+    proxy_env_vars:
+      - http_proxy
+      - https_proxy
+      - ftp_proxy
+      - no_proxy
+      - HTTP_PROXY
+      - HTTPS_PROXY
+      - FTP_PROXY
+      - NO_PROXY
+
+  tasks:
+
+    - name: Remove proxy variables from /etc/environment
+      lineinfile:
+        path: /etc/environment
+        regexp: "^{{ item }}="
+        state: absent
+      loop: "{{ proxy_env_vars }}"
+
+    - name: Remove APT proxy configuration
+      file:
+        path: /etc/apt/apt.conf.d/95proxies
+        state: absent
+
+    - name: Update apt cache
+      apt:
+        update_cache: yes
