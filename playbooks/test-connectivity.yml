@@ -1,0 +1,17 @@
+---
+- name: Test SSH Connectivity
+  hosts: all
+  gather_facts: no
+
+  tasks:
+
+    - name: Ping remote host
+      ansible.builtin.ping:
+
+    - name: Check uptime
+      ansible.builtin.command: uptime
+      register: uptime_output
+
+    - name: Display uptime
+      ansible.builtin.debug:
+        var: uptime_output.stdout
