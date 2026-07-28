@@ -1,0 +1,106 @@
+---
+- name: Harden SSH Cryptography
+  hosts: linux_servers
+  become: yes
+  gather_facts: yes
+
+  vars:
+    ssh_config: /etc/ssh/sshd_config
+    backup_dir: /etc/ssh/backups
+
+  tasks:
+
+    ##################################################
+    # Create Backup Folder
+    ##################################################
+
+    - name: Create backup directory
+      file:
+        path: "{{ backup_dir }}"
+        state: directory
+        owner: root
+        group: root
+        mode: '0755'
+
+    ##################################################
+    # Backup sshd_config
+    ##################################################
+
+    - name: Backup sshd_config
+      copy:
+        src: "{{ ssh_config }}"
+        dest: "{{ backup_dir }}/sshd_config.{{ ansible_date_time.iso8601 }}"
+        remote_src: yes
+        owner: root
+        group: root
+        mode: preserve
+
+    ##################################################
+    # Configure MAC Algorithms
+    ##################################################
+
+    - name: Configure secure MAC algorithms
+      lineinfile:
+        path: "{{ ssh_config }}"
+        regexp: '^#?MACs'
+        line: "MACs {{ secure_macs | join(',') }}"
+        create: yes
+
+    ##################################################
+    # Configure Ciphers
+    ##################################################
+
+    - name: Configure secure ciphers
+      lineinfile:
+        path: "{{ ssh_config }}"
+        regexp: '^#?Ciphers'
+        line: "Ciphers {{ secure_ciphers | join(',') }}"
+        create: yes
+
+    ##################################################
+    # Configure Key Exchange Algorithms
+    ##################################################
+
+    - name: Configure secure KEX algorithms
+      lineinfile:
+        path: "{{ ssh_config }}"
+        regexp: '^#?KexAlgorithms'
+        line: "KexAlgorithms {{ secure_kex | join(',') }}"
+        create: yes
+
+    ##################################################
+    # Validate SSH Configuration
+    ##################################################
+
+    - name: Validate ssh configuration
+      command: sshd -t
+      register: ssh_validation
+      changed_when: false
+
+    ##################################################
+    # Restart SSH
+    ##################################################
+
+    - name: Restart SSH Service
+      service:
+        name: "{{ ssh_service_name }}"
+        state: restarted
+      when: ssh_validation.rc == 0
+
+    ##################################################
+    # Display Status
+    ##################################################
+
+    - name: Display Result
+      debug:
+        msg: |
+          SSH Hardening Completed Successfully.
+
+          Secure MACs:
+          {{ secure_macs | join('\n') }}
+
+          Secure Ciphers:
+          {{ secure_ciphers | join('\n') }}
+
+          Secure KEX:
+          {{ secure_kex | join('\n') }}
