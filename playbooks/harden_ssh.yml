@@ -1,6 +1,6 @@
 ---
 - name: Harden SSH Cryptography
-  hosts: linux_servers
+  hosts: all
   become: yes
   gather_facts: yes
 
