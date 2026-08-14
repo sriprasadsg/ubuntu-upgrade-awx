@@ -1,0 +1,235 @@
+---
+# ============================================================
+# Ubuntu Vulnerability Identification Playbook
+# ============================================================
+#
+# Purpose:
+#   - Identify Ubuntu version
+#   - Identify running kernel
+#   - Check available security updates
+#   - Check packages with upgrades available
+#   - Check held packages
+#   - Check reboot requirement
+#   - Check unattended-upgrades status
+#   - Generate a vulnerability/security report
+#
+# Usage:
+#   ansible-playbook -i inventory.ini identify_vulnerabilities.yml
+#
+# ============================================================
+
+- name: Identify Ubuntu Vulnerabilities
+  hosts: all
+  become: true
+  gather_facts: true
+
+  vars:
+    report_dir: "/var/log/ansible-vulnerability"
+    report_file: "/var/log/ansible-vulnerability/vulnerability_report.txt"
+
+  tasks:
+
+    # --------------------------------------------------------
+    # Create report directory
+    # --------------------------------------------------------
+
+    - name: Create vulnerability report directory
+      ansible.builtin.file:
+        path: "{{ report_dir }}"
+        state: directory
+        owner: root
+        group: root
+        mode: "0750"
+
+    # --------------------------------------------------------
+    # Ubuntu information
+    # --------------------------------------------------------
+
+    - name: Get Ubuntu release information
+      ansible.builtin.shell: |
+        . /etc/os-release
+        echo "$PRETTY_NAME"
+      register: ubuntu_version
+      changed_when: false
+
+    - name: Get running kernel
+      ansible.builtin.command:
+        cmd: uname -r
+      register: running_kernel
+      changed_when: false
+
+    # --------------------------------------------------------
+    # APT update
+    # --------------------------------------------------------
+
+    - name: Update APT package metadata
+      ansible.builtin.apt:
+        update_cache: true
+        cache_valid_time: 3600
+
+    # --------------------------------------------------------
+    # Check security updates
+    # --------------------------------------------------------
+
+    - name: Check available upgrades
+      ansible.builtin.shell: |
+        apt list --upgradable 2>/dev/null
+      register: available_updates
+      changed_when: false
+
+    - name: Count available updates
+      ansible.builtin.shell: |
+        apt list --upgradable 2>/dev/null | tail -n +2 | grep -v '^$' | wc -l
+      register: update_count
+      changed_when: false
+
+    # --------------------------------------------------------
+    # Check held packages
+    # --------------------------------------------------------
+
+    - name: Check held packages
+      ansible.builtin.shell: |
+        apt-mark showhold
+      register: held_packages
+      changed_when: false
+
+    # --------------------------------------------------------
+    # Check reboot requirement
+    # --------------------------------------------------------
+
+    - name: Check whether reboot is required
+      ansible.builtin.stat:
+        path: /var/run/reboot-required
+      register: reboot_required
+
+    # --------------------------------------------------------
+    # Check reboot-required packages
+    # --------------------------------------------------------
+
+    - name: Check packages requiring reboot
+      ansible.builtin.shell: |
+        if [ -f /var/run/reboot-required.pkgs ]; then
+          cat /var/run/reboot-required.pkgs
+        else
+          echo "None"
+        fi
+      register: reboot_packages
+      changed_when: false
+
+    # --------------------------------------------------------
+    # Check unattended upgrades
+    # --------------------------------------------------------
+
+    - name: Check unattended-upgrades installation
+      ansible.builtin.shell: |
+        dpkg-query -W -f='${Status}\n' unattended-upgrades 2>/dev/null \
+        | grep -q "install ok installed" \
+        && echo "INSTALLED" \
+        || echo "NOT INSTALLED"
+      register: unattended_status
+      changed_when: false
+
+    # --------------------------------------------------------
+    # Check APT errors
+    # --------------------------------------------------------
+
+    - name: Check APT broken packages
+      ansible.builtin.shell: |
+        dpkg --audit
+      register: dpkg_audit
+      changed_when: false
+      failed_when: false
+
+    # --------------------------------------------------------
+    # Generate report
+    # --------------------------------------------------------
+
+    - name: Generate vulnerability report
+      ansible.builtin.copy:
+        dest: "{{ report_file }}"
+        owner: root
+        group: root
+        mode: "0640"
+        content: |
+          ============================================================
+          UBUNTU VULNERABILITY / SECURITY UPDATE REPORT
+          ============================================================
+
+          Hostname:
+          {{ inventory_hostname }}
+
+          IP Address:
+          {{ ansible_default_ipv4.address | default('Unknown') }}
+
+          Ubuntu:
+          {{ ubuntu_version.stdout }}
+
+          Kernel:
+          {{ running_kernel.stdout }}
+
+          Scan Time:
+          {{ ansible_date_time.iso8601 }}
+
+          ------------------------------------------------------------
+          AVAILABLE UPDATES
+          ------------------------------------------------------------
+
+          Total packages with updates:
+          {{ update_count.stdout }}
+
+          {{ available_updates.stdout }}
+
+          ------------------------------------------------------------
+          HELD PACKAGES
+          ------------------------------------------------------------
+
+          {{ held_packages.stdout | default('None') }}
+
+          ------------------------------------------------------------
+          REBOOT STATUS
+          ------------------------------------------------------------
+
+          Reboot required:
+          {% if reboot_required.stat.exists %}
+          YES
+          {% else %}
+          NO
+          {% endif %}
+
+          Packages requiring reboot:
+          {{ reboot_packages.stdout }}
+
+          ------------------------------------------------------------
+          UNATTENDED UPGRADES
+          ------------------------------------------------------------
+
+          {{ unattended_status.stdout }}
+
+          ------------------------------------------------------------
+          DPKG AUDIT
+          ------------------------------------------------------------
+
+          {{ dpkg_audit.stdout | default('No problems detected') }}
+
+          ============================================================
+          END OF REPORT
+          ============================================================
+
+    # --------------------------------------------------------
+    # Display summary
+    # --------------------------------------------------------
+
+    - name: Display vulnerability summary
+      ansible.builtin.debug:
+        msg:
+          - "=============================================="
+          - " Ubuntu Vulnerability Scan"
+          - "=============================================="
+          - "Host: {{ inventory_hostname }}"
+          - "Ubuntu: {{ ubuntu_version.stdout }}"
+          - "Kernel: {{ running_kernel.stdout }}"
+          - "Updates available: {{ update_count.stdout }}"
+          - "Reboot required: {{ reboot_required.stat.exists }}"
+          - "Held packages: {{ held_packages.stdout | default('None') }}"
+          - "Report: {{ report_file }}"
+          - "=============================================="
