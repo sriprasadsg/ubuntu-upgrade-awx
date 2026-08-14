@@ -1,0 +1,238 @@
+---
+# ============================================================
+# Ubuntu Vulnerability Remediation Playbook
+# ============================================================
+#
+# Purpose:
+#   - Update APT metadata
+#   - Repair broken dpkg state
+#   - Upgrade vulnerable packages
+#   - Upgrade Ubuntu packages
+#   - Remove obsolete packages
+#   - Install security update infrastructure
+#   - Detect reboot requirement
+#   - Reboot only when explicitly enabled
+#
+# Usage:
+#
+#   Normal remediation:
+#   ansible-playbook -i inventory.ini remediate_vulnerabilities.yml
+#
+#   Remediation + reboot:
+#   ansible-playbook -i inventory.ini remediate_vulnerabilities.yml \
+#       -e "perform_reboot=true"
+#
+# ============================================================
+
+- name: Remediate Ubuntu Vulnerabilities
+  hosts: all
+  become: true
+  gather_facts: true
+
+  vars:
+
+    # --------------------------------------------------------
+    # SAFETY SETTINGS
+    # --------------------------------------------------------
+
+    perform_reboot: false
+
+    reboot_timeout: 900
+
+    # --------------------------------------------------------
+    # Package management
+    # --------------------------------------------------------
+
+    apt_update_cache: true
+
+  tasks:
+
+    # ========================================================
+    # PRE-REMEDIATION INFORMATION
+    # ========================================================
+
+    - name: Display remediation target
+      ansible.builtin.debug:
+        msg:
+          - "=============================================="
+          - " Ubuntu Vulnerability Remediation"
+          - "=============================================="
+          - "Host: {{ inventory_hostname }}"
+          - "Ubuntu: {{ ansible_distribution }} {{ ansible_distribution_version }}"
+          - "Kernel: {{ ansible_kernel }}"
+          - "=============================================="
+
+    # ========================================================
+    # APT REPOSITORY VALIDATION
+    # ========================================================
+
+    - name: Update APT cache
+      ansible.builtin.apt:
+        update_cache: true
+        cache_valid_time: 0
+        update_cache_retries: 5
+        update_cache_retry_max_delay: 12
+
+    # ========================================================
+    # REPAIR INTERRUPTED DPKG
+    # ========================================================
+
+    - name: Repair interrupted dpkg configuration
+      ansible.builtin.command:
+        cmd: dpkg --configure -a
+      register: dpkg_repair
+      changed_when: false
+
+    # ========================================================
+    # FIX BROKEN DEPENDENCIES
+    # ========================================================
+
+    - name: Fix broken package dependencies
+      ansible.builtin.apt:
+        state: fixed
+
+    # ========================================================
+    # UPGRADE SECURITY PACKAGES
+    # ========================================================
+
+    - name: Upgrade all available Ubuntu packages
+      ansible.builtin.apt:
+        upgrade: dist
+        autoremove: false
+        autoclean: true
+        force_apt_get: true
+      register: package_upgrade
+
+    # ========================================================
+    # REMOVE UNUSED PACKAGES
+    # ========================================================
+
+    - name: Remove automatically installed unused packages
+      ansible.builtin.apt:
+        autoremove: true
+        purge: true
+      register: autoremove_result
+
+    # ========================================================
+    # CLEAN APT CACHE
+    # ========================================================
+
+    - name: Clean APT cache
+      ansible.builtin.apt:
+        autoclean: true
+
+    # ========================================================
+    # INSTALL UNATTENDED-UPGRADES
+    # ========================================================
+
+    - name: Install unattended-upgrades
+      ansible.builtin.apt:
+        name:
+          - unattended-upgrades
+          - update-notifier-common
+        state: present
+
+    # ========================================================
+    # CHECK FOR REBOOT
+    # ========================================================
+
+    - name: Check whether reboot is required
+      ansible.builtin.stat:
+        path: /var/run/reboot-required
+      register: reboot_required
+
+    - name: Read reboot-required packages
+      ansible.builtin.shell: |
+        if [ -f /var/run/reboot-required.pkgs ]; then
+          cat /var/run/reboot-required.pkgs
+        else
+          echo "None"
+        fi
+      register: reboot_packages
+      changed_when: false
+
+    # ========================================================
+    # DISPLAY REBOOT STATUS
+    # ========================================================
+
+    - name: Display reboot status
+      ansible.builtin.debug:
+        msg:
+          - "=============================================="
+          - " REMEDIATION RESULT"
+          - "=============================================="
+          - "Host: {{ inventory_hostname }}"
+          - "Packages changed: {{ package_upgrade.changed }}"
+          - "Reboot required: {{ reboot_required.stat.exists }}"
+          - "Reboot packages:"
+          - "{{ reboot_packages.stdout }}"
+          - "=============================================="
+
+    # ========================================================
+    # OPTIONAL REBOOT
+    # ========================================================
+
+    - name: Reboot server when required
+      ansible.builtin.reboot:
+        reboot_timeout: "{{ reboot_timeout }}"
+        connect_timeout: 10
+        pre_reboot_delay: 5
+        post_reboot_delay: 15
+        test_command: uptime
+      when:
+        - perform_reboot | bool
+        - reboot_required.stat.exists
+
+    # ========================================================
+    # POST-REBOOT KERNEL CHECK
+    # ========================================================
+
+    - name: Get current running kernel
+      ansible.builtin.command:
+        cmd: uname -r
+      register: final_kernel
+      changed_when: false
+
+    # ========================================================
+    # FINAL SECURITY UPDATE CHECK
+    # ========================================================
+
+    - name: Refresh package metadata after remediation
+      ansible.builtin.apt:
+        update_cache: true
+        cache_valid_time: 0
+
+    - name: Check remaining updates
+      ansible.builtin.shell: |
+        apt list --upgradable 2>/dev/null
+      register: remaining_updates
+      changed_when: false
+
+    - name: Count remaining updates
+      ansible.builtin.shell: |
+        apt list --upgradable 2>/dev/null \
+        | tail -n +2 \
+        | grep -v '^$' \
+        | wc -l
+      register: remaining_update_count
+      changed_when: false
+
+    # ========================================================
+    # FINAL REPORT
+    # ========================================================
+
+    - name: Display final remediation result
+      ansible.builtin.debug:
+        msg:
+          - "================================================"
+          - " UBUNTU REMEDIATION COMPLETED"
+          - "================================================"
+          - "Host: {{ inventory_hostname }}"
+          - "Ubuntu: {{ ansible_distribution }} {{ ansible_distribution_version }}"
+          - "Original Kernel: {{ ansible_kernel }}"
+          - "Current Kernel: {{ final_kernel.stdout }}"
+          - "Packages changed: {{ package_upgrade.changed }}"
+          - "Remaining updates: {{ remaining_update_count.stdout }}"
+          - "Reboot required before remediation: {{ reboot_required.stat.exists }}"
+          - "Reboot executed: {{ perform_reboot }}"
+          - "================================================"
