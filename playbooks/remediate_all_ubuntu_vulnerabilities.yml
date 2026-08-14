@@ -1,0 +1,637 @@
+---
+- name: Ubuntu full vulnerability remediation
+  hosts: all
+  become: true
+  gather_facts: true
+
+  vars:
+    perform_reboot: false
+    reboot_timeout: 900
+    report_dir: /var/log/ansible-vulnerability
+    source_file: "events-2026-08-14T15_11_03.262Z.csv"
+    source_record_count: 10000
+    source_unique_cves: 3797
+    source_findings:
+      - package: 'accountsservice'
+        vulnerable_version: '23.13.9-2ubuntu6'
+      - package: 'amd64-microcode'
+        vulnerable_version: '3.20250311.1ubuntu0.24.04.1'
+      - package: 'curl'
+        vulnerable_version: '8.5.0-2ubuntu10.9'
+      - package: 'dnsmasq-base'
+        vulnerable_version: '2.90-2ubuntu0.3'
+      - package: 'fonts-opensymbol'
+        vulnerable_version: '4:102.12+LibO24.2.7-0ubuntu0.24.04.5'
+      - package: 'gir1.2-accountsservice-1.0'
+        vulnerable_version: '23.13.9-2ubuntu6'
+      - package: 'gstreamer1.0-gtk3'
+        vulnerable_version: '1.24.2-1ubuntu1.4'
+      - package: 'gstreamer1.0-pipewire'
+        vulnerable_version: '1.0.5-1ubuntu3.2'
+      - package: 'gstreamer1.0-plugins-good'
+        vulnerable_version: '1.24.2-1ubuntu1.4'
+      - package: 'gzip'
+        vulnerable_version: '1.12-1ubuntu3.1'
+      - package: 'hplip'
+        vulnerable_version: '3.23.12+dfsg0-0ubuntu5'
+      - package: 'hplip-data'
+        vulnerable_version: '3.23.12+dfsg0-0ubuntu5'
+      - package: 'krb5-locales'
+        vulnerable_version: '1.20.1-6ubuntu2.6'
+      - package: 'libaccountsservice0'
+        vulnerable_version: '23.13.9-2ubuntu6'
+      - package: 'libarchive13t64'
+        vulnerable_version: '3.7.2-2ubuntu0.7'
+      - package: 'libasound2-data'
+        vulnerable_version: '1.2.11-1ubuntu0.2'
+      - package: 'libasound2t64'
+        vulnerable_version: '1.2.11-1ubuntu0.2'
+      - package: 'libatopology2t64'
+        vulnerable_version: '1.2.11-1ubuntu0.2'
+      - package: 'libc-bin'
+        vulnerable_version: '2.39-0ubuntu8.7'
+      - package: 'libc-dev-bin'
+        vulnerable_version: '2.39-0ubuntu8.7'
+      - package: 'libc-devtools'
+        vulnerable_version: '2.39-0ubuntu8.7'
+      - package: 'libc6'
+        vulnerable_version: '2.39-0ubuntu8.7'
+      - package: 'libcurl3t64-gnutls'
+        vulnerable_version: '8.5.0-2ubuntu10.9'
+      - package: 'libcurl4t64'
+        vulnerable_version: '8.5.0-2ubuntu10.9'
+      - package: 'libde265-0'
+        vulnerable_version: '1.0.15-1build3'
+      - package: 'libexif12'
+        vulnerable_version: '0.6.24-1build2'
+      - package: 'libgif7'
+        vulnerable_version: '5.2.2-1ubuntu1'
+      - package: 'libgssapi-krb5-2'
+        vulnerable_version: '1.20.1-6ubuntu2.6'
+      - package: 'libgstreamer-plugins-good1.0-0'
+        vulnerable_version: '1.24.2-1ubuntu1.4'
+      - package: 'libhpmud0'
+        vulnerable_version: '3.23.12+dfsg0-0ubuntu5'
+      - package: 'libhtml-parser-perl'
+        vulnerable_version: '3.81-1build3'
+      - package: 'libhttp-date-perl'
+        vulnerable_version: '6.06-1'
+      - package: 'libidn12'
+        vulnerable_version: '1.42-1build1'
+      - package: 'libjbig2dec0'
+        vulnerable_version: '0.20-1build3'
+      - package: 'libk5crypto3'
+        vulnerable_version: '1.20.1-6ubuntu2.6'
+      - package: 'libkrb5-3'
+        vulnerable_version: '1.20.1-6ubuntu2.6'
+      - package: 'libkrb5support0'
+        vulnerable_version: '1.20.1-6ubuntu2.6'
+      - package: 'libldb2'
+        vulnerable_version: '2:2.8.0+samba4.19.5+dfsg-4ubuntu9.6'
+      - package: 'libncurses6'
+        vulnerable_version: '6.4+20240113-1ubuntu2'
+      - package: 'libncursesw6'
+        vulnerable_version: '6.4+20240113-1ubuntu2'
+      - package: 'libnfs14'
+        vulnerable_version: '5.0.2-1build1'
+      - package: 'libnghttp2-14'
+        vulnerable_version: '1.59.0-1ubuntu0.3'
+      - package: 'libnss3'
+        vulnerable_version: '2:3.98-1ubuntu0.1'
+      - package: 'libntfs-3g89t64'
+        vulnerable_version: '1:2022.10.3-1.2ubuntu3.1'
+      - package: 'libpam-modules'
+        vulnerable_version: '1.5.3-5ubuntu5.5'
+      - package: 'libpam-modules-bin'
+        vulnerable_version: '1.5.3-5ubuntu5.5'
+      - package: 'libpam-runtime'
+        vulnerable_version: '1.5.3-5ubuntu5.5'
+      - package: 'libpam0g'
+        vulnerable_version: '1.5.3-5ubuntu5.5'
+      - package: 'libperl5.38t64'
+        vulnerable_version: '5.38.2-3.2ubuntu0.2'
+      - package: 'libpipewire-0.3-0t64'
+        vulnerable_version: '1.0.5-1ubuntu3.2'
+      - package: 'libpipewire-0.3-common'
+        vulnerable_version: '1.0.5-1ubuntu3.2'
+      - package: 'libpipewire-0.3-modules'
+        vulnerable_version: '1.0.5-1ubuntu3.2'
+      - package: 'libpython3.12-minimal'
+        vulnerable_version: '3.12.3-1ubuntu0.13'
+      - package: 'libpython3.12-stdlib'
+        vulnerable_version: '3.12.3-1ubuntu0.13'
+      - package: 'libpython3.12t64'
+        vulnerable_version: '3.12.3-1ubuntu0.13'
+      - package: 'libraw23t64'
+        vulnerable_version: '0.21.2-2.1ubuntu0.24.04.1'
+      - package: 'libreoffice-base-core'
+        vulnerable_version: '4:24.2.7-0ubuntu0.24.04.5'
+      - package: 'libreoffice-calc'
+        vulnerable_version: '4:24.2.7-0ubuntu0.24.04.5'
+      - package: 'libreoffice-common'
+        vulnerable_version: '4:24.2.7-0ubuntu0.24.04.5'
+      - package: 'libreoffice-core'
+        vulnerable_version: '4:24.2.7-0ubuntu0.24.04.5'
+      - package: 'libreoffice-draw'
+        vulnerable_version: '4:24.2.7-0ubuntu0.24.04.5'
+      - package: 'libreoffice-gnome'
+        vulnerable_version: '4:24.2.7-0ubuntu0.24.04.5'
+      - package: 'libreoffice-gtk3'
+        vulnerable_version: '4:24.2.7-0ubuntu0.24.04.5'
+      - package: 'libreoffice-help-common'
+        vulnerable_version: '4:24.2.7-0ubuntu0.24.04.5'
+      - package: 'libreoffice-help-en-us'
+        vulnerable_version: '4:24.2.7-0ubuntu0.24.04.5'
+      - package: 'libreoffice-impress'
+        vulnerable_version: '4:24.2.7-0ubuntu0.24.04.5'
+      - package: 'libreoffice-math'
+        vulnerable_version: '4:24.2.7-0ubuntu0.24.04.5'
+      - package: 'libreoffice-style-colibre'
+        vulnerable_version: '4:24.2.7-0ubuntu0.24.04.5'
+      - package: 'libreoffice-style-elementary'
+        vulnerable_version: '4:24.2.7-0ubuntu0.24.04.5'
+      - package: 'libreoffice-style-yaru'
+        vulnerable_version: '4:24.2.7-0ubuntu0.24.04.5'
+      - package: 'libreoffice-uiconfig-calc'
+        vulnerable_version: '4:24.2.7-0ubuntu0.24.04.5'
+      - package: 'libreoffice-uiconfig-common'
+        vulnerable_version: '4:24.2.7-0ubuntu0.24.04.5'
+      - package: 'libreoffice-uiconfig-draw'
+        vulnerable_version: '4:24.2.7-0ubuntu0.24.04.5'
+      - package: 'libreoffice-uiconfig-impress'
+        vulnerable_version: '4:24.2.7-0ubuntu0.24.04.5'
+      - package: 'libreoffice-uiconfig-math'
+        vulnerable_version: '4:24.2.7-0ubuntu0.24.04.5'
+      - package: 'libreoffice-uiconfig-writer'
+        vulnerable_version: '4:24.2.7-0ubuntu0.24.04.5'
+      - package: 'libreoffice-writer'
+        vulnerable_version: '4:24.2.7-0ubuntu0.24.04.5'
+      - package: 'libsane-hpaio'
+        vulnerable_version: '3.23.12+dfsg0-0ubuntu5'
+      - package: 'libsmbclient0'
+        vulnerable_version: '2:4.19.5+dfsg-4ubuntu9.6'
+      - package: 'libsoup-2.4-1'
+        vulnerable_version: '2.74.3-6ubuntu1.6'
+      - package: 'libsoup2.4-common'
+        vulnerable_version: '2.74.3-6ubuntu1.6'
+      - package: 'libspa-0.2-bluetooth'
+        vulnerable_version: '1.0.5-1ubuntu3.2'
+      - package: 'libspa-0.2-modules'
+        vulnerable_version: '1.0.5-1ubuntu3.2'
+      - package: 'libsqlite3-0'
+        vulnerable_version: '3.45.1-1ubuntu2.5'
+      - package: 'libtinfo6'
+        vulnerable_version: '6.4+20240113-1ubuntu2'
+      - package: 'libuno-cppu3t64'
+        vulnerable_version: '4:24.2.7-0ubuntu0.24.04.5'
+      - package: 'libuno-cppuhelpergcc3-3t64'
+        vulnerable_version: '4:24.2.7-0ubuntu0.24.04.5'
+      - package: 'libuno-purpenvhelpergcc3-3t64'
+        vulnerable_version: '4:24.2.7-0ubuntu0.24.04.5'
+      - package: 'libuno-sal3t64'
+        vulnerable_version: '4:24.2.7-0ubuntu0.24.04.5'
+      - package: 'libuno-salhelpergcc3-3t64'
+        vulnerable_version: '4:24.2.7-0ubuntu0.24.04.5'
+      - package: 'libvncclient1'
+        vulnerable_version: '0.9.14+dfsg-1build2'
+      - package: 'libwbclient0'
+        vulnerable_version: '2:4.19.5+dfsg-4ubuntu9.6'
+      - package: 'libxfont2'
+        vulnerable_version: '1:2.0.6-1build1'
+      - package: 'libxml2'
+        vulnerable_version: '2.9.14+dfsg-1.3ubuntu3.7'
+      - package: 'libxpm4'
+        vulnerable_version: '1:3.5.17-1build2'
+      - package: 'linux-image-5.15.0-185-generic'
+        vulnerable_version: '5.15.0-185.195'
+      - package: 'linux-image-5.15.0-187-generic'
+        vulnerable_version: '5.15.0-187.197'
+      - package: 'linux-image-6.8.0-117-generic'
+        vulnerable_version: '6.8.0-117.117'
+      - package: 'linux-image-6.8.0-124-generic'
+        vulnerable_version: '6.8.0-124.124'
+      - package: 'locales'
+        vulnerable_version: '2.39-0ubuntu8.7'
+      - package: 'lxd'
+        vulnerable_version: '4.0.12-a55c9d0'
+      - package: 'ncurses-base'
+        vulnerable_version: '6.4+20240113-1ubuntu2'
+      - package: 'ncurses-bin'
+        vulnerable_version: '6.4+20240113-1ubuntu2'
+      - package: 'ncurses-term'
+        vulnerable_version: '6.4+20240113-1ubuntu2'
+      - package: 'ntfs-3g'
+        vulnerable_version: '1:2022.10.3-1.2ubuntu3.1'
+      - package: 'openssh-client'
+        vulnerable_version: '1:9.6p1-3ubuntu13.16'
+      - package: 'openssh-server'
+        vulnerable_version: '1:9.6p1-3ubuntu13.16'
+      - package: 'openssh-sftp-server'
+        vulnerable_version: '1:9.6p1-3ubuntu13.16'
+      - package: 'openvpn'
+        vulnerable_version: '2.6.19-0ubuntu0.24.04.2'
+      - package: 'perl'
+        vulnerable_version: '5.38.2-3.2ubuntu0.2'
+      - package: 'perl-base'
+        vulnerable_version: '5.38.2-3.2ubuntu0.2'
+      - package: 'perl-modules-5.38'
+        vulnerable_version: '5.38.2-3.2ubuntu0.2'
+      - package: 'pipewire'
+        vulnerable_version: '1.0.5-1ubuntu3.2'
+      - package: 'pipewire-alsa'
+        vulnerable_version: '1.0.5-1ubuntu3.2'
+      - package: 'pipewire-audio'
+        vulnerable_version: '1.0.5-1ubuntu3.2'
+      - package: 'pipewire-bin'
+        vulnerable_version: '1.0.5-1ubuntu3.2'
+      - package: 'pipewire-pulse'
+        vulnerable_version: '1.0.5-1ubuntu3.2'
+      - package: 'printer-driver-hpcups'
+        vulnerable_version: '3.23.12+dfsg0-0ubuntu5'
+      - package: 'printer-driver-postscript-hp'
+        vulnerable_version: '3.23.12+dfsg0-0ubuntu5'
+      - package: 'python3-httplib2'
+        vulnerable_version: '0.20.4-3'
+      - package: 'python3-idna'
+        vulnerable_version: '3.6-2ubuntu0.1'
+      - package: 'python3-uno'
+        vulnerable_version: '4:24.2.7-0ubuntu0.24.04.5'
+      - package: 'python3.12'
+        vulnerable_version: '3.12.3-1ubuntu0.13'
+      - package: 'python3.12-minimal'
+        vulnerable_version: '3.12.3-1ubuntu0.13'
+      - package: 'samba-libs'
+        vulnerable_version: '2:4.19.5+dfsg-4ubuntu9.6'
+      - package: 'ssh'
+        vulnerable_version: '1:9.6p1-3ubuntu13.16'
+      - package: 'tar'
+        vulnerable_version: '1.35+dfsg-3build1'
+      - package: 'uno-libs-private'
+        vulnerable_version: '4:24.2.7-0ubuntu0.24.04.5'
+      - package: 'ure'
+        vulnerable_version: '4:24.2.7-0ubuntu0.24.04.5'
+      - package: 'wget'
+        vulnerable_version: '1.21.4-1ubuntu4.1'
+
+  tasks:
+    - name: Validate Ubuntu
+      ansible.builtin.assert:
+        that:
+          - ansible_facts.distribution == "Ubuntu"
+        fail_msg: "This playbook is intended for Ubuntu."
+
+    - name: Create report directory
+      ansible.builtin.file:
+        path: "{{ report_dir }}"
+        state: directory
+        owner: root
+        group: root
+        mode: "0750"
+
+    - name: Generate report timestamp
+      ansible.builtin.command: date +%Y%m%d_%H%M%S
+      register: report_timestamp
+      changed_when: false
+
+    - name: Set report path
+      ansible.builtin.set_fact:
+        report_file: "{{ report_dir }}/full_vulnerability_remediation_{{ report_timestamp.stdout }}.txt"
+
+    - name: Capture running kernel BEFORE
+      ansible.builtin.command: uname -r
+      register: kernel_before
+      changed_when: false
+
+    - name: Capture reboot requirement BEFORE
+      ansible.builtin.stat:
+        path: /var/run/reboot-required
+      register: reboot_before
+
+    - name: Capture installed kernels BEFORE
+      ansible.builtin.shell: |
+        find /boot -maxdepth 1 -type f -name 'vmlinuz-*' -printf '%f\n' 2>/dev/null |
+        sed 's/^vmlinuz-//' | sort -V
+      args:
+        executable: /bin/bash
+      register: kernels_before
+      changed_when: false
+
+    - name: Capture source package versions BEFORE
+      ansible.builtin.shell: |
+        {% for f in source_findings %}
+        printf '%s\t' '{{ f.package }}'
+        dpkg-query -W -f='${Version}' '{{ f.package }}' 2>/dev/null || printf 'NOT_INSTALLED'
+        printf '\n'
+        {% endfor %}
+      args:
+        executable: /bin/bash
+      register: source_before
+      changed_when: false
+
+    - name: Update APT cache
+      ansible.builtin.apt:
+        update_cache: true
+        cache_valid_time: 0
+        update_cache_retries: 5
+        update_cache_retry_max_delay: 15
+      register: apt_update
+
+    - name: Upgrade all installed packages including phased updates
+      ansible.builtin.command:
+        cmd: apt-get -o APT::Get::Always-Include-Phased-Updates=true upgrade -y
+      register: apt_upgrade
+      changed_when: "'0 upgraded' not in (apt_upgrade.stdout | default(''))"
+      failed_when: false
+
+    - name: Full distribution upgrade including phased updates
+      ansible.builtin.command:
+        cmd: apt-get -o APT::Get::Always-Include-Phased-Updates=true dist-upgrade -y
+      register: apt_dist_upgrade
+      changed_when: "'0 upgraded' not in (apt_dist_upgrade.stdout | default(''))"
+      failed_when: false
+
+    - name: Select Ubuntu kernel meta package
+      ansible.builtin.set_fact:
+        kernel_meta_package: >-
+          {{ 'linux-generic-hwe-24.04'
+             if ansible_facts.distribution_major_version | int == 24
+             else 'linux-generic' }}
+
+    - name: Upgrade Ubuntu kernel meta package
+      ansible.builtin.command:
+        cmd: apt-get -o APT::Get::Always-Include-Phased-Updates=true install -y "{{ kernel_meta_package }}"
+      register: kernel_upgrade
+      changed_when: "'0 upgraded' not in (kernel_upgrade.stdout | default(''))"
+      failed_when: false
+
+    - name: Repair interrupted dpkg configuration
+      ansible.builtin.command: dpkg --configure -a
+      register: dpkg_configure
+      changed_when: false
+      failed_when: false
+
+    - name: Autoremove obsolete dependencies
+      ansible.builtin.command:
+        cmd: apt-get autoremove -y
+      register: autoremove
+      changed_when: "'0 removed' not in (autoremove.stdout | default(''))"
+      failed_when: false
+
+    - name: Capture installed kernels AFTER package upgrade
+      ansible.builtin.shell: |
+        find /boot -maxdepth 1 -type f -name 'vmlinuz-*' -printf '%f\n' 2>/dev/null |
+        sed 's/^vmlinuz-//' | sort -V
+      args:
+        executable: /bin/bash
+      register: kernels_after_install
+      changed_when: false
+
+    - name: Determine newest installed kernel
+      ansible.builtin.set_fact:
+        newest_kernel: >-
+          {{ kernels_after_install.stdout_lines[-1]
+             if (kernels_after_install.stdout_lines | length > 0)
+             else '' }}
+
+    - name: Determine whether a newer kernel was installed
+      ansible.builtin.set_fact:
+        newer_kernel_installed: >-
+          {{ newest_kernel | length > 0 and newest_kernel != kernel_before.stdout }}
+
+    - name: Check reboot requirement AFTER upgrade
+      ansible.builtin.stat:
+        path: /var/run/reboot-required
+      register: reboot_after_upgrade
+
+    - name: Reboot if requested and required
+      ansible.builtin.reboot:
+        reboot_timeout: "{{ reboot_timeout }}"
+        connect_timeout: 10
+        pre_reboot_delay: 5
+        post_reboot_delay: 20
+        test_command: uname -r
+      register: reboot_result
+      when:
+        - perform_reboot | bool
+        - reboot_after_upgrade.stat.exists
+
+    - name: Capture running kernel AFTER
+      ansible.builtin.command: uname -r
+      register: kernel_after
+      changed_when: false
+
+    - name: Capture source package versions AFTER
+      ansible.builtin.shell: |
+        {% for f in source_findings %}
+        printf '%s\t' '{{ f.package }}'
+        dpkg-query -W -f='${Version}' '{{ f.package }}' 2>/dev/null || printf 'NOT_INSTALLED'
+        printf '\n'
+        {% endfor %}
+      args:
+        executable: /bin/bash
+      register: source_after
+      changed_when: false
+
+    - name: Check remaining APT upgrades
+      ansible.builtin.shell: |
+        apt list --upgradable 2>/dev/null | sed '1d' || true
+      args:
+        executable: /bin/bash
+      register: remaining_upgrades
+      changed_when: false
+
+    - name: Capture final reboot requirement
+      ansible.builtin.stat:
+        path: /var/run/reboot-required
+      register: reboot_final
+
+    - name: Capture installed kernels AFTER
+      ansible.builtin.shell: |
+        find /boot -maxdepth 1 -type f -name 'vmlinuz-*' -printf '%f\n' 2>/dev/null |
+        sed 's/^vmlinuz-//' | sort -V
+      args:
+        executable: /bin/bash
+      register: kernels_after
+      changed_when: false
+
+    - name: Determine final status
+      ansible.builtin.set_fact:
+        final_status: >-
+          {{ 'REMEDIATED'
+             if (remaining_upgrades.stdout | trim) == ''
+             and not reboot_final.stat.exists
+             else 'REMEDIATION_INCOMPLETE' }}
+
+    - name: Determine final reason
+      ansible.builtin.set_fact:
+        final_reason: >-
+          {{ 'All currently available package upgrades were applied and no reboot is pending.'
+             if final_status == 'REMEDIATED'
+             else 'Remaining package upgrades exist and/or Ubuntu still requires a reboot. Review the report.' }}
+
+    - name: Display detailed remediation result
+      ansible.builtin.debug:
+        msg: |
+          ============================================================
+          UBUNTU FULL VULNERABILITY REMEDIATION
+          ============================================================
+          Source: {{ source_file }}
+          Host: {{ inventory_hostname }}
+          Records: {{ source_record_count }}
+          Unique CVEs: {{ source_unique_cves }}
+
+          BEFORE
+          Running kernel: {{ kernel_before.stdout }}
+          Installed kernels:
+          {{ kernels_before.stdout if kernels_before.stdout else 'NONE' }}
+          Reboot required: {{ reboot_before.stat.exists }}
+          Source package versions:
+          {{ source_before.stdout if source_before.stdout else 'NONE' }}
+
+          REMEDIATION
+          APT update rc: {{ apt_update.rc | default('N/A') }}
+          apt upgrade: {{ 'CHANGED' if apt_upgrade.changed else 'NO CHANGE' }}
+          apt dist-upgrade: {{ 'CHANGED' if apt_dist_upgrade.changed else 'NO CHANGE' }}
+          Kernel meta package: {{ kernel_meta_package }}
+          Kernel upgrade: {{ 'CHANGED' if kernel_upgrade.changed else 'NO CHANGE' }}
+          Newer kernel installed: {{ newer_kernel_installed }}
+          Newest kernel: {{ newest_kernel }}
+          Reboot requested: {{ perform_reboot }}
+          Reboot performed: {{ reboot_result.changed | default(false) }}
+
+          AFTER
+          Running kernel: {{ kernel_after.stdout }}
+          Installed kernels:
+          {{ kernels_after.stdout if kernels_after.stdout else 'NONE' }}
+          Remaining APT upgrades:
+          {{ remaining_upgrades.stdout if remaining_upgrades.stdout else 'NONE' }}
+          Reboot required: {{ reboot_final.stat.exists }}
+          Source package versions AFTER:
+          {{ source_after.stdout if source_after.stdout else 'NONE' }}
+
+          RESULT: {{ final_status }}
+          REASON: {{ final_reason }}
+          REPORT: {{ report_file }}
+          ============================================================
+
+    - name: Write complete remediation report
+      ansible.builtin.copy:
+        dest: "{{ report_file }}"
+        owner: root
+        group: root
+        mode: "0640"
+        content: |
+          ============================================================
+          UBUNTU FULL VULNERABILITY REMEDIATION REPORT
+          ============================================================
+
+          Source CSV:
+          {{ source_file }}
+
+          Host:
+          {{ inventory_hostname }}
+
+          Report timestamp:
+          {{ report_timestamp.stdout }}
+
+          Vulnerability records:
+          {{ source_record_count }}
+
+          Unique CVEs:
+          {{ source_unique_cves }}
+
+          ============================================================
+          1. BEFORE STATE
+          ============================================================
+
+          Running kernel:
+          {{ kernel_before.stdout }}
+
+          Installed kernels:
+          {{ kernels_before.stdout if kernels_before.stdout else 'NONE' }}
+
+          Reboot required:
+          {{ reboot_before.stat.exists }}
+
+          Source package versions BEFORE:
+          {{ source_before.stdout if source_before.stdout else 'NONE' }}
+
+          ============================================================
+          2. REMEDIATION ACTIONS
+          ============================================================
+
+          APT update rc:
+          {{ apt_update.rc | default('N/A') }}
+
+          APT upgrade:
+          {{ 'CHANGED' if apt_upgrade.changed else 'NO CHANGE' }}
+
+          APT upgrade rc:
+          {{ apt_upgrade.rc | default('N/A') }}
+
+          APT dist-upgrade:
+          {{ 'CHANGED' if apt_dist_upgrade.changed else 'NO CHANGE' }}
+
+          APT dist-upgrade rc:
+          {{ apt_dist_upgrade.rc | default('N/A') }}
+
+          Kernel meta package:
+          {{ kernel_meta_package }}
+
+          Kernel upgrade:
+          {{ 'CHANGED' if kernel_upgrade.changed else 'NO CHANGE' }}
+
+          Autoremove:
+          {{ 'CHANGED' if autoremove.changed else 'NO CHANGE' }}
+
+          Newer kernel installed:
+          {{ newer_kernel_installed }}
+
+          Newest installed kernel:
+          {{ newest_kernel }}
+
+          Reboot requested:
+          {{ perform_reboot }}
+
+          Reboot performed:
+          {{ reboot_result.changed | default(false) }}
+
+          ============================================================
+          3. AFTER STATE
+          ============================================================
+
+          Running kernel:
+          {{ kernel_after.stdout }}
+
+          Installed kernels:
+          {{ kernels_after.stdout if kernels_after.stdout else 'NONE' }}
+
+          Remaining APT upgrades:
+          {{ remaining_upgrades.stdout if remaining_upgrades.stdout else 'NONE' }}
+
+          Reboot required:
+          {{ reboot_final.stat.exists }}
+
+          Source package versions AFTER:
+          {{ source_after.stdout if source_after.stdout else 'NONE' }}
+
+          ============================================================
+          4. FINAL STATUS
+          ============================================================
+
+          STATUS:
+          {{ final_status }}
+
+          REASON:
+          {{ final_reason }}
+
+          ============================================================
+          END REPORT
+          ============================================================
+
+    - name: Fail if remediation is incomplete
+      ansible.builtin.fail:
+        msg: >-
+          Vulnerability remediation is incomplete. {{ final_reason }}
+          Full report: {{ report_file }}
+      when: final_status != 'REMEDIATED'
