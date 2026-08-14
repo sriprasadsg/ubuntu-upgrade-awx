@@ -1,0 +1,573 @@
+---
+# ============================================================
+# Ubuntu Vulnerability Remediation Playbook
+# ============================================================
+#
+# Built from the uploaded Wazuh vulnerability export:
+#   events-2026-08-14T11_24_45.303Z.csv
+#
+# The export contains 1,609 ACTIVE vulnerability events across
+# 11 package names. This playbook:
+#
+#   1. Verifies Ubuntu/Debian-family hosts.
+#   2. Records installed versions of the affected packages.
+#   3. Updates APT metadata.
+#   4. Upgrades only affected packages that are installed.
+#   5. Handles kernel remediation separately by installing the
+#      Ubuntu generic kernel meta-packages.
+#   6. Repairs interrupted dpkg/apt state.
+#   7. Optionally reboots when required.
+#   8. Re-checks package versions and remaining APT updates.
+#   9. Creates a per-host remediation report.
+#
+# IMPORTANT:
+#   A CVE is fixed only when the vendor-fixed package version
+#   is installed. APT repository metadata is the source of truth
+#   for the currently available Ubuntu fix.
+#
+# Default:
+#   No automatic reboot.
+#
+# To reboot when required:
+#   ansible-playbook -i inventory.ini remediate_identified_vulnerabilities.yml \
+#       -e "perform_reboot=true"
+#
+# ============================================================
+
+- name: Remediate vulnerabilities identified by Wazuh
+  hosts: all
+  become: true
+  gather_facts: true
+
+  vars:
+
+    # --------------------------------------------------------
+    # Safety controls
+    # --------------------------------------------------------
+
+    perform_reboot: false
+    reboot_timeout: 900
+
+    # --------------------------------------------------------
+    # Report location
+    # --------------------------------------------------------
+
+    report_dir: /var/log/ansible-vulnerability
+
+    # --------------------------------------------------------
+    # Packages identified as ACTIVE in the supplied Wazuh CSV.
+    #
+    # These are targeted only when currently installed.
+    # --------------------------------------------------------
+
+    identified_packages:
+      - libwinpr3-3
+      - libfreerdp3-3
+      - libfreerdp-server3-3
+      - libxpm4
+      - libgif7
+      - wget
+      - snapd
+      - libde265-0
+      - libarchive13t64
+      - libllvm19
+
+    # --------------------------------------------------------
+    # Kernel handling
+    #
+    # The CSV contains:
+    #   linux-image-7.0.0-28-generic
+    #
+    # Do NOT blindly install that exact old kernel package.
+    # Install Ubuntu's supported generic kernel meta-package so
+    # APT selects the currently supported kernel for the host.
+    # --------------------------------------------------------
+
+    kernel_packages:
+      - linux-generic
+      - linux-image-generic
+      - linux-headers-generic
+
+  pre_tasks:
+
+    # ========================================================
+    # Validate operating system
+    # ========================================================
+
+    - name: Fail if the host is not Ubuntu
+      ansible.builtin.assert:
+        that:
+          - ansible_facts.distribution == "Ubuntu"
+        fail_msg: >-
+          This playbook is intended for Ubuntu hosts.
+          Detected: {{ ansible_facts.distribution }}
+          {{ ansible_facts.distribution_version }}
+
+    - name: Create report directory
+      ansible.builtin.file:
+        path: "{{ report_dir }}"
+        state: directory
+        owner: root
+        group: root
+        mode: "0750"
+
+    - name: Generate report timestamp
+      ansible.builtin.command:
+        cmd: date +%Y%m%d_%H%M%S
+      register: report_timestamp
+      changed_when: false
+
+    - name: Set report filename
+      ansible.builtin.set_fact:
+        remediation_report: >-
+          {{ report_dir }}/identified_vulnerability_remediation_{{ report_timestamp.stdout }}.txt
+
+  tasks:
+
+    # ========================================================
+    # BEFORE STATE
+    # ========================================================
+
+    - name: Get running kernel before remediation
+      ansible.builtin.command:
+        cmd: uname -r
+      register: kernel_before
+      changed_when: false
+
+    - name: Update APT cache
+      ansible.builtin.apt:
+        update_cache: true
+        cache_valid_time: 0
+        update_cache_retries: 5
+        update_cache_retry_max_delay: 12
+
+    - name: Check which identified packages are installed
+      ansible.builtin.shell: |
+        set -o pipefail
+        dpkg-query -W -f='${binary:Package}\t${Version}\n' 2>/dev/null \
+          | awk 'NR==FNR {wanted[$0]=1; next} ($1 in wanted) {print $0}' \
+          <(printf '%s\n' \
+            {% for pkg in identified_packages %}'{{ pkg }}' {% endfor %}) -
+      args:
+        executable: /bin/bash
+      register: installed_identified_packages
+      changed_when: false
+
+    - name: Get available upgrades for identified packages
+      ansible.builtin.shell: |
+        apt list --upgradable 2>/dev/null | grep -E '^({{ identified_packages | map('regex_escape') | join('|') }})/' || true
+      register: identified_upgrades_before
+      changed_when: false
+
+    - name: Check reboot requirement before remediation
+      ansible.builtin.stat:
+        path: /var/run/reboot-required
+      register: reboot_before
+
+    # ========================================================
+    # REPAIR PACKAGE MANAGER STATE
+    # ========================================================
+
+    - name: Repair interrupted dpkg configuration
+      ansible.builtin.command:
+        cmd: dpkg --configure -a
+      register: dpkg_repair
+      changed_when: false
+      failed_when: false
+
+    - name: Repair broken APT dependencies
+      ansible.builtin.apt:
+        state: fixed
+      register: dependency_repair
+
+    # ========================================================
+    # TARGETED PACKAGE REMEDIATION
+    #
+    # Only packages from the supplied Wazuh export are targeted.
+    # If a package is not installed, it is skipped rather than
+    # accidentally installing an application that was not present.
+    # ========================================================
+
+    - name: Upgrade identified vulnerable packages that are installed
+      ansible.builtin.apt:
+        name: "{{ item }}"
+        state: latest
+        update_cache: false
+        only_upgrade: true
+      loop: "{{ identified_packages }}"
+      register: targeted_package_remediation
+      when: item in (installed_identified_packages.stdout_lines | map('regex_replace', '\t.*$', '') | list)
+
+    # ========================================================
+    # KERNEL REMEDIATION
+    #
+    # Install the supported Ubuntu generic kernel meta-packages.
+    # This allows APT to select the current vendor-supported kernel
+    # rather than hard-coding the vulnerable version from Wazuh.
+    # ========================================================
+
+    - name: Install/update supported Ubuntu generic kernel
+      ansible.builtin.apt:
+        name: "{{ kernel_packages }}"
+        state: latest
+        update_cache: false
+      register: kernel_remediation
+
+    # ========================================================
+    # SNAPD
+    #
+    # snapd is included above in identified_packages, but this
+    # explicit task provides a clear remediation record.
+    # ========================================================
+
+    - name: Ensure snapd is upgraded when already installed
+      ansible.builtin.apt:
+        name: snapd
+        state: latest
+        only_upgrade: true
+      register: snapd_remediation
+      when: "'snapd' in (installed_identified_packages.stdout_lines | map('regex_replace', '\t.*$', '') | list)"
+
+    # ========================================================
+    # GENERAL SECURITY UPDATE
+    #
+    # After targeted remediation, apply remaining vendor updates.
+    # This catches dependencies and security fixes required by
+    # the targeted packages.
+    # ========================================================
+
+    - name: Apply remaining Ubuntu security/package updates
+      ansible.builtin.apt:
+        upgrade: dist
+        force_apt_get: true
+        autoremove: false
+        autoclean: true
+      register: distribution_upgrade
+
+    # ========================================================
+    # REMOVE UNUSED DEPENDENCIES
+    # ========================================================
+
+    - name: Remove unused packages
+      ansible.builtin.apt:
+        autoremove: true
+        purge: true
+      register: autoremove_result
+
+    # ========================================================
+    # CHECK REBOOT
+    # ========================================================
+
+    - name: Check reboot requirement after remediation
+      ansible.builtin.stat:
+        path: /var/run/reboot-required
+      register: reboot_after_updates
+
+    - name: Read reboot-required packages
+      ansible.builtin.shell: |
+        if [ -f /var/run/reboot-required.pkgs ]; then
+          cat /var/run/reboot-required.pkgs
+        else
+          echo "None"
+        fi
+      register: reboot_packages
+      changed_when: false
+
+    # ========================================================
+    # OPTIONAL REBOOT
+    # ========================================================
+
+    - name: Reboot when required and explicitly enabled
+      ansible.builtin.reboot:
+        reboot_timeout: "{{ reboot_timeout }}"
+        connect_timeout: 10
+        pre_reboot_delay: 5
+        post_reboot_delay: 20
+        test_command: uptime
+      register: reboot_result
+      when:
+        - perform_reboot | bool
+        - reboot_after_updates.stat.exists
+
+    # ========================================================
+    # AFTER STATE
+    # ========================================================
+
+    - name: Get running kernel after remediation
+      ansible.builtin.command:
+        cmd: uname -r
+      register: kernel_after
+      changed_when: false
+
+    - name: Refresh APT metadata after remediation
+      ansible.builtin.apt:
+        update_cache: true
+        cache_valid_time: 0
+
+    - name: Check remaining upgrades
+      ansible.builtin.shell: |
+        apt list --upgradable 2>/dev/null
+      register: remaining_upgrades
+      changed_when: false
+
+    - name: Count remaining upgrades
+      ansible.builtin.shell: |
+        apt list --upgradable 2>/dev/null \
+          | tail -n +2 \
+          | grep -v '^$' \
+          | wc -l
+      register: remaining_upgrade_count
+      changed_when: false
+
+    - name: Get final versions of identified packages
+      ansible.builtin.shell: |
+        for pkg in \
+          libwinpr3-3 \
+          libfreerdp3-3 \
+          libfreerdp-server3-3 \
+          libxpm4 \
+          libgif7 \
+          wget \
+          snapd \
+          libde265-0 \
+          libarchive13t64 \
+          libllvm19; do
+
+          if dpkg-query -W -f='${Status}' "$pkg" 2>/dev/null \
+              | grep -q "install ok installed"; then
+            dpkg-query -W -f="${pkg}"'\t${Version}\n' "$pkg"
+          fi
+        done
+      register: final_identified_versions
+      changed_when: false
+
+    - name: Check final reboot requirement
+      ansible.builtin.stat:
+        path: /var/run/reboot-required
+      register: final_reboot_required
+
+    - name: Check final dpkg audit
+      ansible.builtin.command:
+        cmd: dpkg --audit
+      register: final_dpkg_audit
+      changed_when: false
+      failed_when: false
+
+    - name: Get failed systemd services
+      ansible.builtin.shell: |
+        systemctl --failed --no-legend --no-pager || true
+      register: failed_services
+      changed_when: false
+
+    # ========================================================
+    # DETERMINE RESULT
+    # ========================================================
+
+    - name: Determine remediation status
+      ansible.builtin.set_fact:
+        remediation_status: >-
+          {% if final_reboot_required.stat.exists %}
+          REMEDIATED - REBOOT REQUIRED
+          {% elif remaining_upgrade_count.stdout | int == 0
+             and (final_dpkg_audit.stdout | trim) == "" %}
+          REMEDIATION COMPLETE
+          {% elif (remaining_upgrade_count.stdout | int)
+             < (identified_upgrades_before.stdout_lines | length) %}
+          PARTIALLY REMEDIATED
+          {% else %}
+          REQUIRES MANUAL REVIEW
+          {% endif %}
+
+    # ========================================================
+    # REPORT
+    # ========================================================
+
+    - name: Generate remediation report
+      ansible.builtin.copy:
+        dest: "{{ remediation_report }}"
+        owner: root
+        group: root
+        mode: "0640"
+        content: |
+          ============================================================
+          WAZUH IDENTIFIED UBUNTU VULNERABILITY REMEDIATION REPORT
+          ============================================================
+
+          Host:
+          {{ inventory_hostname }}
+
+          IP:
+          {{ ansible_default_ipv4.address | default('Unknown') }}
+
+          Ubuntu:
+          {{ ansible_distribution }} {{ ansible_distribution_version }}
+
+          Report:
+          {{ report_timestamp.stdout }}
+
+          ============================================================
+          SOURCE DATA
+          ============================================================
+
+          Active Wazuh package targets:
+          {{ identified_packages | join(', ') }}
+
+          ============================================================
+          KERNEL
+          ============================================================
+
+          Kernel BEFORE:
+          {{ kernel_before.stdout }}
+
+          Kernel AFTER:
+          {{ kernel_after.stdout }}
+
+          ============================================================
+          IDENTIFIED PACKAGES INSTALLED BEFORE
+          ============================================================
+
+          {{ installed_identified_packages.stdout | default('None') }}
+
+          ============================================================
+          IDENTIFIED PACKAGE UPGRADES AVAILABLE BEFORE
+          ============================================================
+
+          {{ identified_upgrades_before.stdout | default('None') }}
+
+          ============================================================
+          TARGETED REMEDIATION
+          ============================================================
+
+          Targeted packages were upgraded only when already installed.
+
+          {% for result in targeted_package_remediation.results | default([]) %}
+          Package:
+          {{ result.item }}
+          Changed:
+          {{ result.changed | default(false) }}
+          {% if result.msg is defined %}
+          Message:
+          {{ result.msg }}
+          {% endif %}
+
+          {% endfor %}
+
+          ============================================================
+          KERNEL REMEDIATION
+          ============================================================
+
+          Packages:
+          {{ kernel_packages | join(', ') }}
+
+          Changed:
+          {{ kernel_remediation.changed }}
+
+          Message:
+          {{ kernel_remediation.msg | default('See Ansible result') }}
+
+          ============================================================
+          DISTRIBUTION UPDATE
+          ============================================================
+
+          Changed:
+          {{ distribution_upgrade.changed }}
+
+          Message:
+          {{ distribution_upgrade.msg | default('See Ansible result') }}
+
+          ============================================================
+          AUTOREMOVE
+          ============================================================
+
+          Changed:
+          {{ autoremove_result.changed }}
+
+          ============================================================
+          REBOOT
+          ============================================================
+
+          Reboot Required Before:
+          {{ reboot_before.stat.exists }}
+
+          Reboot Required After Updates:
+          {{ reboot_after_updates.stat.exists }}
+
+          Reboot Performed:
+          {{ (reboot_result is defined and reboot_result.changed) | default(false) }}
+
+          Reboot Required At End:
+          {{ final_reboot_required.stat.exists }}
+
+          Reboot Packages:
+          {{ reboot_packages.stdout }}
+
+          ============================================================
+          FINAL IDENTIFIED PACKAGE VERSIONS
+          ============================================================
+
+          {{ final_identified_versions.stdout | default('None') }}
+
+          ============================================================
+          REMAINING APT UPDATES
+          ============================================================
+
+          Count:
+          {{ remaining_upgrade_count.stdout }}
+
+          {{ remaining_upgrades.stdout }}
+
+          ============================================================
+          DPKG AUDIT
+          ============================================================
+
+          {{ final_dpkg_audit.stdout | default('No problems detected') }}
+
+          ============================================================
+          FAILED SERVICES
+          ============================================================
+
+          {{ failed_services.stdout | default('None') }}
+
+          ============================================================
+          FINAL STATUS
+          ============================================================
+
+          {{ remediation_status | trim }}
+
+          ============================================================
+          IMPORTANT
+          ============================================================
+
+          This report confirms package remediation activity.
+          It does not independently prove that every CVE in the
+          original Wazuh export is closed.
+
+          Wazuh should perform a fresh vulnerability scan after
+          remediation. CVE closure should be confirmed by the
+          post-remediation Wazuh result and the installed package
+          version/fixed-version comparison.
+
+          ============================================================
+          END REPORT
+          ============================================================
+      register: report_created
+
+    # ========================================================
+    # FINAL CONSOLE SUMMARY
+    # ========================================================
+
+    - name: Display remediation summary
+      ansible.builtin.debug:
+        msg:
+          - "============================================================"
+          - " WAZUH VULNERABILITY REMEDIATION"
+          - "============================================================"
+          - "Host: {{ inventory_hostname }}"
+          - "Ubuntu: {{ ansible_distribution }} {{ ansible_distribution_version }}"
+          - "Kernel BEFORE: {{ kernel_before.stdout }}"
+          - "Kernel AFTER: {{ kernel_after.stdout }}"
+          - "Remaining APT updates: {{ remaining_upgrade_count.stdout }}"
+          - "Reboot required: {{ final_reboot_required.stat.exists }}"
+          - "Status: {{ remediation_status | trim }}"
+          - "Report: {{ remediation_report }}"
+          - "============================================================"
