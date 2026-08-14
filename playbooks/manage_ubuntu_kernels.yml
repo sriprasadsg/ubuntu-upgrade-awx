@@ -1,0 +1,388 @@
+---
+# ============================================================
+# Ubuntu Kernel Management Playbook
+# ============================================================
+#
+# Policy:
+#   1. Detect the currently running kernel.
+#   2. Install/update Ubuntu's supported generic kernel.
+#   3. Detect the newest installed kernel.
+#   4. Reboot only when explicitly requested.
+#   5. After reboot, verify the running kernel.
+#   6. Remove obsolete kernels only AFTER the system is running
+#      the newest installed kernel.
+#   7. Keep:
+#        - currently running kernel
+#        - newest installed kernel
+#      for rollback safety.
+#
+# Default:
+#   perform_reboot=false
+#
+# Test:
+#   ansible-playbook -i inventory.ini manage_ubuntu_kernels.yml
+#
+# Automatic reboot:
+#   ansible-playbook -i inventory.ini manage_ubuntu_kernels.yml \
+#       -e "perform_reboot=true"
+#
+# ============================================================
+
+- name: Manage Ubuntu Kernels Safely
+  hosts: all
+  become: true
+  gather_facts: true
+
+  vars:
+    perform_reboot: false
+    reboot_timeout: 900
+
+    report_dir: /var/log/ansible-kernel
+    keep_kernel_count: 2
+
+  tasks:
+
+    # ========================================================
+    # 1. Validate Ubuntu
+    # ========================================================
+
+    - name: Verify Ubuntu operating system
+      ansible.builtin.assert:
+        that:
+          - ansible_facts.distribution == "Ubuntu"
+        fail_msg: >-
+          This playbook supports Ubuntu only.
+          Detected {{ ansible_facts.distribution }}
+          {{ ansible_facts.distribution_version }}.
+
+    # ========================================================
+    # 2. Create report directory
+    # ========================================================
+
+    - name: Create kernel report directory
+      ansible.builtin.file:
+        path: "{{ report_dir }}"
+        state: directory
+        owner: root
+        group: root
+        mode: "0750"
+
+    - name: Generate report timestamp
+      ansible.builtin.command:
+        cmd: date +%Y%m%d_%H%M%S
+      register: report_timestamp
+      changed_when: false
+
+    - name: Set report filename
+      ansible.builtin.set_fact:
+        kernel_report: "{{ report_dir }}/kernel_report_{{ report_timestamp.stdout }}.txt"
+
+    # ========================================================
+    # 3. Get running kernel
+    # ========================================================
+
+    - name: Get currently running kernel
+      ansible.builtin.command:
+        cmd: uname -r
+      register: running_kernel_before
+      changed_when: false
+
+    # ========================================================
+    # 4. Update APT
+    # ========================================================
+
+    - name: Update APT package metadata
+      ansible.builtin.apt:
+        update_cache: true
+        cache_valid_time: 0
+        update_cache_retries: 5
+        update_cache_retry_max_delay: 12
+
+    # ========================================================
+    # 5. Install/update supported Ubuntu generic kernel
+    #
+    # linux-generic is a meta-package. It points to the
+    # currently supported Ubuntu generic kernel for the release.
+    # ========================================================
+
+    - name: Install/update Ubuntu generic kernel
+      ansible.builtin.apt:
+        name:
+          - linux-generic
+          - linux-image-generic
+          - linux-headers-generic
+        state: latest
+      register: kernel_update
+
+    # ========================================================
+    # 6. Detect installed kernels
+    # ========================================================
+
+    - name: Get installed kernel image packages
+      ansible.builtin.shell: |
+        dpkg-query -W -f='${binary:Package}\n' 'linux-image-*' 2>/dev/null |
+        grep -E '^linux-image-[0-9].*-generic$' |
+        sort -V || true
+      register: installed_kernel_packages
+      changed_when: false
+
+    - name: Get installed kernel versions
+      ansible.builtin.shell: |
+        ls -1 /boot/vmlinuz-* 2>/dev/null |
+        sed 's#^.*/vmlinuz-##' |
+        sort -V
+      register: installed_kernel_versions
+      changed_when: false
+
+    - name: Determine newest installed kernel
+      ansible.builtin.set_fact:
+        newest_kernel: >-
+          {{
+            installed_kernel_versions.stdout_lines[-1]
+            if installed_kernel_versions.stdout_lines | length > 0
+            else ''
+          }}
+
+    # ========================================================
+    # 7. Check whether reboot is required
+    # ========================================================
+
+    - name: Check Ubuntu reboot requirement
+      ansible.builtin.stat:
+        path: /var/run/reboot-required
+      register: reboot_required
+
+    # ========================================================
+    # 8. Reboot only when explicitly enabled
+    # ========================================================
+
+    - name: Reboot into the newly installed kernel
+      ansible.builtin.reboot:
+        reboot_timeout: "{{ reboot_timeout }}"
+        connect_timeout: 10
+        pre_reboot_delay: 5
+        post_reboot_delay: 20
+        test_command: uname -r
+      register: reboot_result
+      when:
+        - perform_reboot | bool
+        - reboot_required.stat.exists
+
+    # ========================================================
+    # 9. Get kernel after optional reboot
+    # ========================================================
+
+    - name: Get currently running kernel after update/reboot
+      ansible.builtin.command:
+        cmd: uname -r
+      register: running_kernel_after
+      changed_when: false
+
+    # ========================================================
+    # 10. Safety check
+    #
+    # Never remove kernels if the running kernel is not the
+    # newest installed kernel.
+    #
+    # This protects against removing the kernel needed for
+    # the next boot.
+    # ========================================================
+
+    - name: Determine whether kernel cleanup is safe
+      ansible.builtin.set_fact:
+        kernel_cleanup_safe: >-
+          {{
+            (running_kernel_after.stdout == newest_kernel)
+            and (newest_kernel | length > 0)
+          }}
+
+    # ========================================================
+    # 11. Remove obsolete kernels
+    #
+    # Ubuntu's autoremove handles associated kernel packages.
+    # It is executed only when the newest kernel is running.
+    # ========================================================
+
+    - name: Remove obsolete kernel packages
+      ansible.builtin.apt:
+        autoremove: true
+        purge: true
+      register: kernel_cleanup
+      when:
+        - kernel_cleanup_safe | bool
+
+    # ========================================================
+    # 12. Re-scan installed kernels after cleanup
+    # ========================================================
+
+    - name: Get final installed kernels
+      ansible.builtin.shell: |
+        ls -1 /boot/vmlinuz-* 2>/dev/null |
+        sed 's#^.*/vmlinuz-##' |
+        sort -V || true
+      register: final_kernel_versions
+      changed_when: false
+
+    # ========================================================
+    # 13. Check final reboot requirement
+    # ========================================================
+
+    - name: Check final reboot requirement
+      ansible.builtin.stat:
+        path: /var/run/reboot-required
+      register: final_reboot_required
+
+    # ========================================================
+    # 14. Generate report
+    # ========================================================
+
+    - name: Generate kernel management report
+      ansible.builtin.copy:
+        dest: "{{ kernel_report }}"
+        owner: root
+        group: root
+        mode: "0640"
+        content: |
+          ============================================================
+          UBUNTU KERNEL MANAGEMENT REPORT
+          ============================================================
+
+          Host:
+          {{ inventory_hostname }}
+
+          IP Address:
+          {{ ansible_default_ipv4.address | default('Unknown') }}
+
+          Ubuntu:
+          {{ ansible_distribution }} {{ ansible_distribution_version }}
+
+          Report Time:
+          {{ ansible_date_time.iso8601 }}
+
+          ============================================================
+          KERNEL BEFORE
+          ============================================================
+
+          Running Kernel:
+          {{ running_kernel_before.stdout }}
+
+          ============================================================
+          INSTALLED KERNELS BEFORE CLEANUP
+          ============================================================
+
+          {{ installed_kernel_versions.stdout }}
+
+          ============================================================
+          LATEST INSTALLED KERNEL
+          ============================================================
+
+          {{ newest_kernel }}
+
+          ============================================================
+          KERNEL UPDATE
+          ============================================================
+
+          Changed:
+          {{ kernel_update.changed }}
+
+          Message:
+          {{ kernel_update.msg | default('See Ansible task result') }}
+
+          ============================================================
+          REBOOT
+          ============================================================
+
+          Reboot Required:
+          {{ reboot_required.stat.exists }}
+
+          Reboot Requested:
+          {{ perform_reboot }}
+
+          Reboot Performed:
+          {{
+            (reboot_result is defined and reboot_result.changed)
+            | default(false)
+          }}
+
+          ============================================================
+          KERNEL AFTER
+          ============================================================
+
+          Running Kernel:
+          {{ running_kernel_after.stdout }}
+
+          ============================================================
+          CLEANUP
+          ============================================================
+
+          Cleanup Safe:
+          {{ kernel_cleanup_safe }}
+
+          Cleanup Performed:
+          {{
+            (kernel_cleanup is defined and kernel_cleanup.changed)
+            | default(false)
+          }}
+
+          ============================================================
+          FINAL INSTALLED KERNELS
+          ============================================================
+
+          {{ final_kernel_versions.stdout }}
+
+          ============================================================
+          FINAL REBOOT STATUS
+          ============================================================
+
+          Reboot Required:
+          {{ final_reboot_required.stat.exists }}
+
+          ============================================================
+          SAFETY POLICY
+          ============================================================
+
+          Running kernel is never intentionally removed.
+
+          Cleanup is performed only when the running kernel equals
+          the newest installed kernel.
+
+          The playbook uses Ubuntu kernel meta-packages rather than
+          hard-coding a kernel version.
+
+          ============================================================
+          FINAL STATUS
+          ============================================================
+
+          {% if running_kernel_after.stdout == newest_kernel
+                and not final_reboot_required.stat.exists %}
+          KERNEL UPDATED AND CLEANUP COMPLETED
+          {% elif running_kernel_after.stdout != newest_kernel %}
+          NEW KERNEL AVAILABLE - REBOOT REQUIRED
+          {% else %}
+          MANUAL REVIEW REQUIRED
+          {% endif %}
+
+          ============================================================
+          END REPORT
+          ============================================================
+      register: report_result
+
+    # ========================================================
+    # 15. Final console summary
+    # ========================================================
+
+    - name: Display final kernel summary
+      ansible.builtin.debug:
+        msg:
+          - "============================================================"
+          - " UBUNTU KERNEL MANAGEMENT COMPLETED"
+          - "============================================================"
+          - "Host: {{ inventory_hostname }}"
+          - "Kernel BEFORE: {{ running_kernel_before.stdout }}"
+          - "Latest installed: {{ newest_kernel }}"
+          - "Kernel AFTER: {{ running_kernel_after.stdout }}"
+          - "Reboot performed: {{ (reboot_result is defined and reboot_result.changed) | default(false) }}"
+          - "Cleanup safe: {{ kernel_cleanup_safe }}"
+          - "Final reboot required: {{ final_reboot_required.stat.exists }}"
+          - "Report: {{ kernel_report }}"
+          - "============================================================"
