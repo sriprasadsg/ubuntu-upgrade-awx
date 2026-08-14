@@ -1,0 +1,255 @@
+---
+- name: Safely manage and clean old Ubuntu kernels
+  hosts: all
+  become: true
+  gather_facts: true
+
+  vars:
+    perform_reboot: false
+    reboot_timeout: 900
+    report_dir: /var/log/ansible-kernel
+
+  tasks:
+    - name: Verify Ubuntu
+      ansible.builtin.assert:
+        that:
+          - ansible_facts.distribution == "Ubuntu"
+        fail_msg: "This playbook supports Ubuntu only."
+
+    - name: Create report directory
+      ansible.builtin.file:
+        path: "{{ report_dir }}"
+        state: directory
+        owner: root
+        group: root
+        mode: "0750"
+
+    - name: Get report timestamp
+      ansible.builtin.command:
+        cmd: date +%Y%m%d_%H%M%S
+      register: report_timestamp
+      changed_when: false
+
+    - name: Set report path
+      ansible.builtin.set_fact:
+        kernel_report: "{{ report_dir }}/kernel_cleanup_{{ report_timestamp.stdout }}.txt"
+
+    - name: Get running kernel before changes
+      ansible.builtin.command:
+        cmd: uname -r
+      register: running_kernel_before
+      changed_when: false
+
+    - name: Update APT cache
+      ansible.builtin.apt:
+        update_cache: true
+        cache_valid_time: 0
+        update_cache_retries: 5
+        update_cache_retry_max_delay: 12
+
+    - name: Detect HWE kernel
+      ansible.builtin.set_fact:
+        active_hwe: "{{ running_kernel_before.stdout is search('-(6.17|7\\.).*-generic$') }}"
+
+    - name: Select Ubuntu kernel meta package
+      ansible.builtin.set_fact:
+        active_kernel_meta: "{{ 'linux-generic-hwe-24.04' if active_hwe else 'linux-generic' }}"
+
+    - name: Install/update active kernel track
+      ansible.builtin.apt:
+        name: "{{ active_kernel_meta }}"
+        state: latest
+      register: kernel_update
+
+    - name: Get installed kernel versions
+      ansible.builtin.shell: |
+        ls -1 /boot/vmlinuz-* 2>/dev/null |
+          sed 's#^.*/vmlinuz-##' |
+          sort -V
+      register: installed_kernel_versions
+      changed_when: false
+
+    - name: Determine newest installed kernel
+      ansible.builtin.set_fact:
+        newest_kernel: "{{ installed_kernel_versions.stdout_lines[-1] }}"
+
+    - name: Verify running kernel is installed
+      ansible.builtin.assert:
+        that:
+          - running_kernel_before.stdout in installed_kernel_versions.stdout_lines
+        fail_msg: "Running kernel was not found among installed kernels. Cleanup aborted."
+
+    - name: Build protected kernel list
+      ansible.builtin.set_fact:
+        kernels_to_keep: "{{ [running_kernel_before.stdout, newest_kernel] | unique }}"
+
+    - name: Determine old kernels
+      ansible.builtin.set_fact:
+        old_kernels: "{{ installed_kernel_versions.stdout_lines | difference(kernels_to_keep) }}"
+
+    - name: Show cleanup plan
+      ansible.builtin.debug:
+        msg:
+          - "Running kernel: {{ running_kernel_before.stdout }}"
+          - "Newest kernel: {{ newest_kernel }}"
+          - "Kernels to KEEP: {{ kernels_to_keep }}"
+          - "Kernels to REMOVE: {{ old_kernels }}"
+
+    - name: Find installed packages for old kernels
+      ansible.builtin.shell: |
+        set -o pipefail
+        for version in {% for k in old_kernels %}"{{ k }}" {% endfor %}; do
+          dpkg-query -W -f='${binary:Package}	${Status}
+' 2>/dev/null |
+            awk -v v="$version" '
+              $2=="install" && $3=="ok" && $4=="installed" &&
+              ($1=="linux-image-"v ||
+               $1=="linux-modules-"v ||
+               $1=="linux-modules-extra-"v ||
+               $1=="linux-headers-"v ||
+               $1=="linux-image-"v"-generic" ||
+               $1=="linux-modules-"v"-generic" ||
+               $1=="linux-modules-extra-"v"-generic" ||
+               $1=="linux-headers-"v"-generic") {print $1}'
+        done | sort -u
+      args:
+        executable: /bin/bash
+      register: old_kernel_packages
+      changed_when: false
+
+    - name: Safety check - never remove running kernel
+      ansible.builtin.assert:
+        that:
+          - old_kernel_packages.stdout_lines | select('search', running_kernel_before.stdout) | list | length == 0
+        fail_msg: "SAFETY ABORT: running kernel is in cleanup list."
+
+    - name: Remove old kernel packages
+      ansible.builtin.apt:
+        name: "{{ old_kernel_packages.stdout_lines }}"
+        state: absent
+        purge: true
+      register: kernel_cleanup
+      when: old_kernel_packages.stdout_lines | length > 0
+
+    - name: Remove unused dependencies
+      ansible.builtin.apt:
+        autoremove: true
+        purge: true
+      register: autoremove_result
+
+    - name: Update GRUB
+      ansible.builtin.command:
+        cmd: update-grub
+      register: grub_update
+      changed_when: true
+
+    - name: Check reboot requirement
+      ansible.builtin.stat:
+        path: /var/run/reboot-required
+      register: reboot_required
+
+    - name: Reboot when explicitly requested
+      ansible.builtin.reboot:
+        reboot_timeout: "{{ reboot_timeout }}"
+        connect_timeout: 10
+        pre_reboot_delay: 5
+        post_reboot_delay: 20
+        test_command: uname -r
+      register: reboot_result
+      when:
+        - perform_reboot | bool
+        - reboot_required.stat.exists
+
+    - name: Get running kernel after changes
+      ansible.builtin.command:
+        cmd: uname -r
+      register: running_kernel_after
+      changed_when: false
+
+    - name: Get final installed kernels
+      ansible.builtin.shell: |
+        ls -1 /boot/vmlinuz-* 2>/dev/null |
+          sed 's#^.*/vmlinuz-##' |
+          sort -V
+      register: final_kernel_versions
+      changed_when: false
+
+    - name: Check final reboot requirement
+      ansible.builtin.stat:
+        path: /var/run/reboot-required
+      register: final_reboot_required
+
+    - name: Generate kernel cleanup report
+      ansible.builtin.copy:
+        dest: "{{ kernel_report }}"
+        owner: root
+        group: root
+        mode: "0640"
+        content: |
+          ============================================================
+          UBUNTU KERNEL CLEANUP REPORT
+          ============================================================
+
+          Host: {{ inventory_hostname }}
+          Ubuntu: {{ ansible_distribution }} {{ ansible_distribution_version }}
+          Report: {{ report_timestamp.stdout }}
+
+          RUNNING KERNEL BEFORE:
+          {{ running_kernel_before.stdout }}
+
+          INSTALLED KERNELS BEFORE:
+          {{ installed_kernel_versions.stdout }}
+
+          ACTIVE KERNEL TRACK:
+          {{ active_kernel_meta }}
+
+          NEWEST INSTALLED KERNEL:
+          {{ newest_kernel }}
+
+          KERNELS PROTECTED:
+          {{ kernels_to_keep | join(', ') }}
+
+          OLD KERNELS IDENTIFIED:
+          {{ old_kernels | join(', ') if old_kernels else 'None' }}
+
+          PACKAGES REMOVED:
+          {{ old_kernel_packages.stdout | default('None') }}
+
+          RUNNING KERNEL AFTER:
+          {{ running_kernel_after.stdout }}
+
+          INSTALLED KERNELS AFTER:
+          {{ final_kernel_versions.stdout }}
+
+          REBOOT PERFORMED:
+          {{ (reboot_result is defined and reboot_result.changed) | default(false) }}
+
+          FINAL REBOOT REQUIRED:
+          {{ final_reboot_required.stat.exists }}
+
+          STATUS:
+          {% if running_kernel_after.stdout == newest_kernel and not final_reboot_required.stat.exists %}
+          SUCCESS
+          {% elif running_kernel_after.stdout != newest_kernel %}
+          REBOOT REQUIRED
+          {% else %}
+          MANUAL REVIEW REQUIRED
+          {% endif %}
+
+          ============================================================
+          END REPORT
+          ============================================================
+      register: report_result
+
+    - name: Display final summary
+      ansible.builtin.debug:
+        msg:
+          - "Kernel BEFORE: {{ running_kernel_before.stdout }}"
+          - "Newest installed: {{ newest_kernel }}"
+          - "Kernel AFTER: {{ running_kernel_after.stdout }}"
+          - "KEEP: {{ kernels_to_keep }}"
+          - "REMOVE: {{ old_kernels }}"
+          - "Cleanup changed: {{ (kernel_cleanup is defined and kernel_cleanup.changed) | default(false) }}"
+          - "Reboot performed: {{ (reboot_result is defined and reboot_result.changed) | default(false) }}"
+          - "Final reboot required: {{ final_reboot_required.stat.exists }}"
+          - "Report: {{ kernel_report }}"
