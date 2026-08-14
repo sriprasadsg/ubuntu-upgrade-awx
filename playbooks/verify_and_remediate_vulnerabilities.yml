@@ -1,0 +1,498 @@
+---
+# ============================================================
+# verify_and_remediate_vulnerabilities.yml
+# ============================================================
+# Purpose:
+#   1. Verify vulnerable packages before remediation.
+#   2. Attempt remediation using APT.
+#   3. Reboot when requested and required.
+#   4. Verify package/kernel state after remediation.
+#   5. Clearly classify each item as REMEDIATED or NOT_REMEDIATED.
+#   6. Generate a detailed report on every server.
+#
+# Usage:
+#
+# Syntax check:
+#   ansible-playbook --syntax-check -i inventory.ini \
+#     verify_and_remediate_vulnerabilities.yml
+#
+# Normal run:
+#   ansible-playbook -i inventory.ini \
+#     verify_and_remediate_vulnerabilities.yml
+#
+# Kernel remediation + automatic reboot:
+#   ansible-playbook -i inventory.ini \
+#     verify_and_remediate_vulnerabilities.yml \
+#     -e "perform_reboot=true"
+#
+# Report:
+#   /var/log/ansible-vulnerability/
+# ============================================================
+
+- name: Verify and remediate Ubuntu vulnerabilities
+  hosts: all
+  become: true
+  gather_facts: true
+
+  vars:
+    perform_reboot: false
+    reboot_timeout: 900
+    report_dir: /var/log/ansible-vulnerability
+
+    # Vulnerabilities/packages from the supplied Wazuh report.
+    # Add more package/version pairs here as required.
+    vulnerability_items:
+      - id: "linux-image-7.0.0-28-generic"
+        package: "linux-image-7.0.0-28-generic"
+        vulnerable_version: "7.0.0-28.28~24.04.1"
+        type: "kernel"
+
+  tasks:
+
+    # ========================================================
+    # 1. Basic validation
+    # ========================================================
+
+    - name: Verify Ubuntu operating system
+      ansible.builtin.assert:
+        that:
+          - ansible_facts.distribution == "Ubuntu"
+        fail_msg: >-
+          This playbook supports Ubuntu only.
+          Detected {{ ansible_facts.distribution }}
+          {{ ansible_facts.distribution_version }}.
+
+    - name: Create vulnerability report directory
+      ansible.builtin.file:
+        path: "{{ report_dir }}"
+        state: directory
+        owner: root
+        group: root
+        mode: "0750"
+
+    - name: Generate report timestamp
+      ansible.builtin.command:
+        cmd: date +%Y%m%d_%H%M%S
+      register: report_timestamp
+      changed_when: false
+
+    - name: Set report path
+      ansible.builtin.set_fact:
+        vulnerability_report: >-
+          {{ report_dir }}/vulnerability_remediation_{{ report_timestamp.stdout }}.txt
+
+    - name: Get current kernel
+      ansible.builtin.command:
+        cmd: uname -r
+      register: kernel_before
+      changed_when: false
+
+    # ========================================================
+    # 2. Update package metadata
+    # ========================================================
+
+    - name: Update APT cache
+      ansible.builtin.apt:
+        update_cache: true
+        cache_valid_time: 0
+        update_cache_retries: 5
+        update_cache_retry_max_delay: 12
+
+    # ========================================================
+    # 3. Check each vulnerable item BEFORE remediation
+    # ========================================================
+
+    - name: Check vulnerable package versions before remediation
+      ansible.builtin.shell: |
+        dpkg-query -W -f='${Version}' "{{ item.package }}" 2>/dev/null || true
+      args:
+        executable: /bin/bash
+      loop: "{{ vulnerability_items }}"
+      loop_control:
+        label: "{{ item.package }}"
+      register: package_versions_before
+      changed_when: false
+
+    - name: Get APT candidate versions
+      ansible.builtin.shell: |
+        apt-cache policy "{{ item.package }}" 2>/dev/null |
+        awk '/Candidate:/ {print $2; exit}'
+      args:
+        executable: /bin/bash
+      loop: "{{ vulnerability_items }}"
+      loop_control:
+        label: "{{ item.package }}"
+      register: package_candidates
+      changed_when: false
+
+    # ========================================================
+    # 4. Build before-state facts
+    # ========================================================
+
+    - name: Initialize vulnerability result lists
+      ansible.builtin.set_fact:
+        vulnerability_results: []
+        remediation_targets: []
+
+    - name: Build remediation targets
+      ansible.builtin.set_fact:
+        remediation_targets: >-
+          {{
+            remediation_targets +
+            [{
+              'id': item.item.id,
+              'package': item.item.package,
+              'vulnerable_version': item.item.vulnerable_version,
+              'type': item.item.type,
+              'installed_before': item.stdout | trim,
+              'candidate': (
+                package_candidates.results[index].stdout | trim
+              )
+            }]
+          }}
+      loop: "{{ package_versions_before.results }}"
+      loop_control:
+        index_var: index
+        label: "{{ item.item.package }}"
+
+    - name: Display vulnerabilities before remediation
+      ansible.builtin.debug:
+        var: remediation_targets
+
+    # ========================================================
+    # 5. Remediation
+    # ========================================================
+
+    - name: Upgrade vulnerable packages
+      ansible.builtin.apt:
+        name: "{{ item.package }}"
+        state: latest
+        only_upgrade: true
+      loop: "{{ remediation_targets }}"
+      loop_control:
+        label: "{{ item.package }}"
+      register: package_remediation
+      failed_when: false
+
+    # ========================================================
+    # 6. Kernel-specific remediation
+    #
+    # Install the appropriate Ubuntu kernel meta-package.
+    # This is important because installing a versioned kernel
+    # package alone may leave the host tracking an old kernel.
+    # ========================================================
+
+    - name: Detect current kernel track
+      ansible.builtin.set_fact:
+        active_hwe: >-
+          {{
+            kernel_before.stdout is search('^(6\.17|7\.).*-generic$')
+          }}
+
+    - name: Select kernel meta-package
+      ansible.builtin.set_fact:
+        kernel_meta_package: >-
+          {{
+            'linux-generic-hwe-24.04'
+            if active_hwe
+            else 'linux-generic'
+          }}
+
+    - name: Update Ubuntu kernel meta-package
+      ansible.builtin.apt:
+        name: "{{ kernel_meta_package }}"
+        state: latest
+      register: kernel_remediation
+      failed_when: false
+
+    # ========================================================
+    # 7. Check reboot requirement
+    # ========================================================
+
+    - name: Check reboot requirement
+      ansible.builtin.stat:
+        path: /var/run/reboot-required
+      register: reboot_required_before
+
+    - name: Reboot server when requested
+      ansible.builtin.reboot:
+        reboot_timeout: "{{ reboot_timeout }}"
+        connect_timeout: 10
+        pre_reboot_delay: 5
+        post_reboot_delay: 20
+        test_command: uname -r
+      register: reboot_result
+      when:
+        - perform_reboot | bool
+        - reboot_required_before.stat.exists
+
+    # ========================================================
+    # 8. Verify AFTER remediation
+    # ========================================================
+
+    - name: Get kernel after remediation
+      ansible.builtin.command:
+        cmd: uname -r
+      register: kernel_after
+      changed_when: false
+
+    - name: Check vulnerable package versions after remediation
+      ansible.builtin.shell: |
+        dpkg-query -W -f='${Version}' "{{ item.package }}" 2>/dev/null || true
+      args:
+        executable: /bin/bash
+      loop: "{{ vulnerability_items }}"
+      loop_control:
+        label: "{{ item.package }}"
+      register: package_versions_after
+      changed_when: false
+
+    - name: Get final APT candidate versions
+      ansible.builtin.shell: |
+        apt-cache policy "{{ item.package }}" 2>/dev/null |
+        awk '/Candidate:/ {print $2; exit}'
+      args:
+        executable: /bin/bash
+      loop: "{{ vulnerability_items }}"
+      loop_control:
+        label: "{{ item.package }}"
+      register: final_candidates
+      changed_when: false
+
+    # ========================================================
+    # 9. Determine REMEDIATED / NOT_REMEDIATED
+    # ========================================================
+
+    - name: Evaluate remediation results
+      ansible.builtin.set_fact:
+        vulnerability_results: >-
+          {{
+            vulnerability_results +
+            [{
+              'id': item.item.id,
+              'package': item.item.package,
+              'vulnerable_version': item.item.vulnerable_version,
+              'installed_before': item.item.installed_before,
+              'candidate_before': item.item.candidate,
+              'installed_after': item.stdout | trim,
+              'candidate_after': (
+                final_candidates.results[index].stdout | trim
+              ),
+              'result':
+                (
+                  'NOT_REMEDIATED'
+                  if (item.stdout | trim) == item.item.vulnerable_version
+                  else 'REMEDIATED'
+                )
+            }]
+          }}
+      loop: "{{ package_versions_after.results }}"
+      loop_control:
+        index_var: index
+        label: "{{ item.item.package }}"
+
+    - name: Determine unresolved vulnerabilities
+      ansible.builtin.set_fact:
+        unresolved_vulnerabilities: >-
+          {{
+            vulnerability_results
+            | selectattr('result', 'equalto', 'NOT_REMEDIATED')
+            | list
+          }}
+
+    - name: Determine remediated vulnerabilities
+      ansible.builtin.set_fact:
+        remediated_vulnerabilities: >-
+          {{
+            vulnerability_results
+            | selectattr('result', 'equalto', 'REMEDIATED')
+            | list
+          }}
+
+    # ========================================================
+    # 10. Final reboot check
+    # ========================================================
+
+    - name: Check final reboot requirement
+      ansible.builtin.stat:
+        path: /var/run/reboot-required
+      register: reboot_required_after
+
+    # ========================================================
+    # 11. Generate report
+    # ========================================================
+
+    - name: Generate vulnerability remediation report
+      ansible.builtin.copy:
+        dest: "{{ vulnerability_report }}"
+        owner: root
+        group: root
+        mode: "0640"
+        content: |
+          ============================================================
+          UBUNTU VULNERABILITY VERIFICATION & REMEDIATION REPORT
+          ============================================================
+
+          Host:
+          {{ inventory_hostname }}
+
+          Ubuntu:
+          {{ ansible_distribution }} {{ ansible_distribution_version }}
+
+          Report:
+          {{ report_timestamp.stdout }}
+
+          ============================================================
+          KERNEL
+          ============================================================
+
+          Kernel BEFORE:
+          {{ kernel_before.stdout }}
+
+          Kernel AFTER:
+          {{ kernel_after.stdout }}
+
+          Kernel meta-package:
+          {{ kernel_meta_package }}
+
+          Reboot requested:
+          {{ perform_reboot }}
+
+          Reboot performed:
+          {{ (reboot_result is defined and reboot_result.changed) | default(false) }}
+
+          Reboot required AFTER:
+          {{ reboot_required_after.stat.exists }}
+
+          ============================================================
+          VULNERABILITY RESULTS
+          ============================================================
+
+          {% for result in vulnerability_results %}
+          ID:
+          {{ result.id }}
+
+          Package:
+          {{ result.package }}
+
+          Vulnerable version:
+          {{ result.vulnerable_version }}
+
+          Installed BEFORE:
+          {{ result.installed_before }}
+
+          Candidate BEFORE:
+          {{ result.candidate_before }}
+
+          Installed AFTER:
+          {{ result.installed_after }}
+
+          Candidate AFTER:
+          {{ result.candidate_after }}
+
+          RESULT:
+          {{ result.result }}
+
+          ------------------------------------------------------------
+          {% endfor %}
+
+          ============================================================
+          REMEDIATED COUNT
+          ============================================================
+
+          {{ remediated_vulnerabilities | length }}
+
+          ============================================================
+          NOT REMEDIATED COUNT
+          ============================================================
+
+          {{ unresolved_vulnerabilities | length }}
+
+          ============================================================
+          NOT REMEDIATED ITEMS
+          ============================================================
+
+          {% if unresolved_vulnerabilities | length > 0 %}
+          {% for result in unresolved_vulnerabilities %}
+          ID:
+          {{ result.id }}
+
+          Package:
+          {{ result.package }}
+
+          Vulnerable version:
+          {{ result.vulnerable_version }}
+
+          Installed version:
+          {{ result.installed_after }}
+
+          Candidate version:
+          {{ result.candidate_after }}
+
+          STATUS:
+          NOT_REMEDIATED
+
+          ------------------------------------------------------------
+          {% endfor %}
+          {% else %}
+          NONE
+          {% endif %}
+
+          ============================================================
+          FINAL STATUS
+          ============================================================
+
+          {% if unresolved_vulnerabilities | length == 0 %}
+          ALL CHECKED ITEMS REMEDIATED
+          {% else %}
+          REMEDIATION INCOMPLETE - ITEMS REQUIRE MANUAL REVIEW
+          {% endif %}
+
+          ============================================================
+          IMPORTANT
+          ============================================================
+
+          This report verifies local package/kernel state.
+
+          A fresh Wazuh vulnerability scan should be performed after
+          remediation to confirm that the corresponding CVEs are
+          marked Solved by Wazuh.
+
+          ============================================================
+          END REPORT
+          ============================================================
+
+    # ========================================================
+    # 12. Console summary
+    # ========================================================
+
+    - name: Display final remediation summary
+      ansible.builtin.debug:
+        msg:
+          - "============================================================"
+          - " VULNERABILITY REMEDIATION SUMMARY"
+          - "============================================================"
+          - "Host: {{ inventory_hostname }}"
+          - "Kernel BEFORE: {{ kernel_before.stdout }}"
+          - "Kernel AFTER: {{ kernel_after.stdout }}"
+          - "Remediated: {{ remediated_vulnerabilities | length }}"
+          - "NOT REMEDIATED: {{ unresolved_vulnerabilities | length }}"
+          - "Report: {{ vulnerability_report }}"
+          - "============================================================"
+
+    # ========================================================
+    # 13. Make Ansible task fail when vulnerabilities remain
+    #
+    # The report is already written above, so this failure is
+    # intentional and allows AWX/AAP/CI pipelines to detect that
+    # remediation was incomplete.
+    # ========================================================
+
+    - name: Fail if vulnerabilities remain unresolved
+      ansible.builtin.fail:
+        msg: >-
+          {{ unresolved_vulnerabilities | length }}
+          vulnerability item(s) remain NOT_REMEDIATED.
+          Review {{ vulnerability_report }}.
+      when:
+        - unresolved_vulnerabilities | length > 0
