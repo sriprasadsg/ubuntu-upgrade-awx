@@ -1,72 +1,122 @@
 ---
 # ============================================================
-# Ubuntu Vulnerability Remediation Playbook
+# Ubuntu Vulnerability Remediation + Before/After Reporting
 # ============================================================
 #
 # Purpose:
-#   - Update APT metadata
-#   - Repair broken dpkg state
-#   - Upgrade vulnerable packages
-#   - Upgrade Ubuntu packages
-#   - Remove obsolete packages
-#   - Install security update infrastructure
-#   - Detect reboot requirement
-#   - Reboot only when explicitly enabled
+#   1. Collect system/vulnerability information BEFORE remediation
+#   2. Remediate Ubuntu packages
+#   3. Optionally reboot the server
+#   4. Collect system/vulnerability information AFTER remediation
+#   5. Generate BEFORE / REMEDIATION / AFTER / COMPARISON reports
+#
+# Reports are created on EACH managed Ubuntu server:
+#
+#   /var/log/ansible-vulnerability/
+#
+#   vulnerability_before_<timestamp>.txt
+#   remediation_<timestamp>.txt
+#   vulnerability_after_<timestamp>.txt
+#   vulnerability_comparison_<timestamp>.txt
 #
 # Usage:
 #
-#   Normal remediation:
+#   Identify + remediate without reboot:
+#
 #   ansible-playbook -i inventory.ini remediate_vulnerabilities.yml
 #
-#   Remediation + reboot:
+#   Remediate + automatically reboot when required:
+#
 #   ansible-playbook -i inventory.ini remediate_vulnerabilities.yml \
 #       -e "perform_reboot=true"
 #
 # ============================================================
 
-- name: Remediate Ubuntu Vulnerabilities
+- name: Ubuntu Vulnerability Remediation
   hosts: all
   become: true
   gather_facts: true
 
   vars:
 
-    # --------------------------------------------------------
-    # SAFETY SETTINGS
-    # --------------------------------------------------------
+    # ========================================================
+    # CONFIGURATION
+    # ========================================================
 
+    report_dir: "/var/log/ansible-vulnerability"
+
+    # Set true if you want Ansible to reboot automatically
+    # when /var/run/reboot-required exists.
     perform_reboot: false
 
     reboot_timeout: 900
 
-    # --------------------------------------------------------
-    # Package management
-    # --------------------------------------------------------
-
-    apt_update_cache: true
-
   tasks:
 
     # ========================================================
-    # PRE-REMEDIATION INFORMATION
+    # 1. CREATE REPORT DIRECTORY
     # ========================================================
 
-    - name: Display remediation target
-      ansible.builtin.debug:
-        msg:
-          - "=============================================="
-          - " Ubuntu Vulnerability Remediation"
-          - "=============================================="
-          - "Host: {{ inventory_hostname }}"
-          - "Ubuntu: {{ ansible_distribution }} {{ ansible_distribution_version }}"
-          - "Kernel: {{ ansible_kernel }}"
-          - "=============================================="
+    - name: Create vulnerability report directory
+      ansible.builtin.file:
+        path: "{{ report_dir }}"
+        state: directory
+        owner: root
+        group: root
+        mode: "0750"
 
     # ========================================================
-    # APT REPOSITORY VALIDATION
+    # 2. GENERATE TIMESTAMP
     # ========================================================
 
-    - name: Update APT cache
+    - name: Generate report timestamp
+      ansible.builtin.shell: |
+        date +"%Y%m%d_%H%M%S"
+      register: report_timestamp
+      changed_when: false
+
+    - name: Set report filenames
+      ansible.builtin.set_fact:
+        report_id: "{{ report_timestamp.stdout }}"
+        before_report: "{{ report_dir }}/vulnerability_before_{{ report_timestamp.stdout }}.txt"
+        remediation_report: "{{ report_dir }}/remediation_{{ report_timestamp.stdout }}.txt"
+        after_report: "{{ report_dir }}/vulnerability_after_{{ report_timestamp.stdout }}.txt"
+        comparison_report: "{{ report_dir }}/vulnerability_comparison_{{ report_timestamp.stdout }}.txt"
+
+    # ========================================================
+    # 3. SYSTEM INFORMATION BEFORE REMEDIATION
+    # ========================================================
+
+    - name: Get Ubuntu release information
+      ansible.builtin.shell: |
+        . /etc/os-release
+        echo "${PRETTY_NAME}"
+      register: before_os
+      changed_when: false
+
+    - name: Get running kernel
+      ansible.builtin.command:
+        cmd: uname -r
+      register: before_kernel
+      changed_when: false
+
+    - name: Get hostname
+      ansible.builtin.command:
+        cmd: hostname
+      register: before_hostname
+      changed_when: false
+
+    - name: Get system uptime
+      ansible.builtin.command:
+        cmd: uptime -p
+      register: before_uptime
+      changed_when: false
+
+    # ========================================================
+    # 4. APT UPDATE BEFORE REMEDIATION
+    # ========================================================
+
+    - name: Update APT package cache
       ansible.builtin.apt:
         update_cache: true
         cache_valid_time: 0
@@ -74,7 +124,245 @@
         update_cache_retry_max_delay: 12
 
     # ========================================================
-    # REPAIR INTERRUPTED DPKG
+    # 5. CHECK AVAILABLE UPDATES BEFORE
+    # ========================================================
+
+    - name: Get available package updates
+      ansible.builtin.shell: |
+        apt list --upgradable 2>/dev/null
+      register: before_updates
+      changed_when: false
+
+    - name: Count available updates
+      ansible.builtin.shell: |
+        apt list --upgradable 2>/dev/null \
+        | tail -n +2 \
+        | grep -v '^$' \
+        | wc -l
+      register: before_update_count
+      changed_when: false
+
+    # ========================================================
+    # 6. CHECK SECURITY UPDATES
+    # ========================================================
+
+    - name: Get security repository updates
+      ansible.builtin.shell: |
+        apt list --upgradable 2>/dev/null \
+        | grep -Ei 'security|esm' || true
+      register: before_security_updates
+      changed_when: false
+
+    - name: Count security updates
+      ansible.builtin.shell: |
+        apt list --upgradable 2>/dev/null \
+        | grep -Ei 'security|esm' \
+        | wc -l
+      register: before_security_count
+      changed_when: false
+
+    # ========================================================
+    # 7. CHECK HELD PACKAGES
+    # ========================================================
+
+    - name: Get held packages
+      ansible.builtin.shell: |
+        apt-mark showhold
+      register: before_held_packages
+      changed_when: false
+
+    # ========================================================
+    # 8. CHECK REBOOT STATUS
+    # ========================================================
+
+    - name: Check reboot requirement
+      ansible.builtin.stat:
+        path: /var/run/reboot-required
+      register: before_reboot_required
+
+    - name: Get packages requiring reboot
+      ansible.builtin.shell: |
+        if [ -f /var/run/reboot-required.pkgs ]; then
+          cat /var/run/reboot-required.pkgs
+        else
+          echo "None"
+        fi
+      register: before_reboot_packages
+      changed_when: false
+
+    # ========================================================
+    # 9. CHECK BROKEN PACKAGES
+    # ========================================================
+
+    - name: Check dpkg audit
+      ansible.builtin.shell: |
+        dpkg --audit
+      register: before_dpkg_audit
+      changed_when: false
+      failed_when: false
+
+    # ========================================================
+    # 10. CHECK FAILED SERVICES
+    # ========================================================
+
+    - name: Get failed systemd services
+      ansible.builtin.shell: |
+        systemctl --failed --no-legend --no-pager || true
+      register: before_failed_services
+      changed_when: false
+
+    # ========================================================
+    # 11. MEMORY INFORMATION
+    # ========================================================
+
+    - name: Get memory usage
+      ansible.builtin.shell: |
+        free -h
+      register: before_memory
+      changed_when: false
+
+    # ========================================================
+    # 12. DISK INFORMATION
+    # ========================================================
+
+    - name: Get filesystem usage
+      ansible.builtin.shell: |
+        df -hT
+      register: before_disk
+      changed_when: false
+
+    # ========================================================
+    # 13. LOAD INFORMATION
+    # ========================================================
+
+    - name: Get system load
+      ansible.builtin.shell: |
+        uptime
+      register: before_load
+      changed_when: false
+
+    # ========================================================
+    # 14. GENERATE BEFORE REPORT
+    # ========================================================
+
+    - name: Generate BEFORE remediation report
+      ansible.builtin.copy:
+        dest: "{{ before_report }}"
+        owner: root
+        group: root
+        mode: "0640"
+        content: |
+          ============================================================
+          UBUNTU VULNERABILITY REMEDIATION
+          BEFORE REPORT
+          ============================================================
+
+          Report ID:
+          {{ report_id }}
+
+          Hostname:
+          {{ before_hostname.stdout }}
+
+          IP Address:
+          {{ ansible_default_ipv4.address | default('Unknown') }}
+
+          Ubuntu:
+          {{ before_os.stdout }}
+
+          Kernel:
+          {{ before_kernel.stdout }}
+
+          Uptime:
+          {{ before_uptime.stdout }}
+
+          Scan Time:
+          {{ ansible_date_time.iso8601 }}
+
+          ============================================================
+          AVAILABLE UPDATES
+          ============================================================
+
+          Total Updates:
+          {{ before_update_count.stdout }}
+
+          {{ before_updates.stdout }}
+
+          ============================================================
+          SECURITY / ESM UPDATES
+          ============================================================
+
+          Security Updates:
+          {{ before_security_count.stdout }}
+
+          {{ before_security_updates.stdout }}
+
+          ============================================================
+          HELD PACKAGES
+          ============================================================
+
+          {{ before_held_packages.stdout | default('None') }}
+
+          ============================================================
+          REBOOT STATUS
+          ============================================================
+
+          Reboot Required:
+          {% if before_reboot_required.stat.exists %}
+          YES
+          {% else %}
+          NO
+          {% endif %}
+
+          Packages Requiring Reboot:
+          {{ before_reboot_packages.stdout }}
+
+          ============================================================
+          DPKG AUDIT
+          ============================================================
+
+          {{ before_dpkg_audit.stdout | default('No problems detected') }}
+
+          ============================================================
+          FAILED SERVICES
+          ============================================================
+
+          {{ before_failed_services.stdout | default('None') }}
+
+          ============================================================
+          MEMORY
+          ============================================================
+
+          {{ before_memory.stdout }}
+
+          ============================================================
+          DISK
+          ============================================================
+
+          {{ before_disk.stdout }}
+
+          ============================================================
+          SYSTEM LOAD
+          ============================================================
+
+          {{ before_load.stdout }}
+
+          ============================================================
+          END BEFORE REPORT
+          ============================================================
+      register: before_report_result
+
+    # ========================================================
+    # 15. START REMEDIATION
+    # ========================================================
+
+    - name: Record remediation start time
+      ansible.builtin.shell: |
+        date --iso-8601=seconds
+      register: remediation_start
+      changed_when: false
+
+    # ========================================================
+    # 16. REPAIR DPKG
     # ========================================================
 
     - name: Repair interrupted dpkg configuration
@@ -82,20 +370,22 @@
         cmd: dpkg --configure -a
       register: dpkg_repair
       changed_when: false
+      failed_when: false
 
     # ========================================================
-    # FIX BROKEN DEPENDENCIES
+    # 17. FIX BROKEN DEPENDENCIES
     # ========================================================
 
     - name: Fix broken package dependencies
       ansible.builtin.apt:
         state: fixed
+      register: dependency_fix
 
     # ========================================================
-    # UPGRADE SECURITY PACKAGES
+    # 18. UPGRADE ALL PACKAGES
     # ========================================================
 
-    - name: Upgrade all available Ubuntu packages
+    - name: Upgrade Ubuntu packages
       ansible.builtin.apt:
         upgrade: dist
         autoremove: false
@@ -104,17 +394,17 @@
       register: package_upgrade
 
     # ========================================================
-    # REMOVE UNUSED PACKAGES
+    # 19. REMOVE UNUSED PACKAGES
     # ========================================================
 
-    - name: Remove automatically installed unused packages
+    - name: Remove unused packages
       ansible.builtin.apt:
         autoremove: true
         purge: true
       register: autoremove_result
 
     # ========================================================
-    # CLEAN APT CACHE
+    # 20. CLEAN APT CACHE
     # ========================================================
 
     - name: Clean APT cache
@@ -122,7 +412,7 @@
         autoclean: true
 
     # ========================================================
-    # INSTALL UNATTENDED-UPGRADES
+    # 21. INSTALL SECURITY UPDATE COMPONENTS
     # ========================================================
 
     - name: Install unattended-upgrades
@@ -131,45 +421,125 @@
           - unattended-upgrades
           - update-notifier-common
         state: present
+      register: unattended_upgrade_install
 
     # ========================================================
-    # CHECK FOR REBOOT
+    # 22. RECORD REMEDIATION END TIME
     # ========================================================
 
-    - name: Check whether reboot is required
+    - name: Record remediation end time
+      ansible.builtin.shell: |
+        date --iso-8601=seconds
+      register: remediation_end
+      changed_when: false
+
+    # ========================================================
+    # 23. CREATE REMEDIATION REPORT
+    # ========================================================
+
+    - name: Generate remediation report
+      ansible.builtin.copy:
+        dest: "{{ remediation_report }}"
+        owner: root
+        group: root
+        mode: "0640"
+        content: |
+          ============================================================
+          UBUNTU VULNERABILITY REMEDIATION
+          REMEDIATION REPORT
+          ============================================================
+
+          Report ID:
+          {{ report_id }}
+
+          Hostname:
+          {{ inventory_hostname }}
+
+          Ubuntu:
+          {{ ansible_distribution }} {{ ansible_distribution_version }}
+
+          ============================================================
+          REMEDIATION START
+          ============================================================
+
+          {{ remediation_start.stdout }}
+
+          ============================================================
+          DPKG REPAIR
+          ============================================================
+
+          Return Code:
+          {{ dpkg_repair.rc }}
+
+          Output:
+          {{ dpkg_repair.stdout | default('None') }}
+
+          Error:
+          {{ dpkg_repair.stderr | default('None') }}
+
+          ============================================================
+          DEPENDENCY REPAIR
+          ============================================================
+
+          Changed:
+          {{ dependency_fix.changed }}
+
+          ============================================================
+          PACKAGE UPGRADE
+          ============================================================
+
+          Changed:
+          {{ package_upgrade.changed }}
+
+          Packages Changed:
+          {{ package_upgrade.msg | default('See Ansible output') }}
+
+          ============================================================
+          AUTOREMOVE
+          ============================================================
+
+          Changed:
+          {{ autoremove_result.changed }}
+
+          ============================================================
+          UNATTENDED UPGRADES
+          ============================================================
+
+          Changed:
+          {{ unattended_upgrade_install.changed }}
+
+          ============================================================
+          REMEDIATION END
+          ============================================================
+
+          {{ remediation_end.stdout }}
+
+          ============================================================
+          END REMEDIATION REPORT
+          ============================================================
+      register: remediation_report_result
+
+    # ========================================================
+    # 24. CHECK REBOOT REQUIREMENT AFTER REMEDIATION
+    # ========================================================
+
+    - name: Check reboot requirement after remediation
       ansible.builtin.stat:
         path: /var/run/reboot-required
-      register: reboot_required
+      register: after_reboot_required_before_reboot
 
-    - name: Read reboot-required packages
+    - name: Get reboot-required packages
       ansible.builtin.shell: |
         if [ -f /var/run/reboot-required.pkgs ]; then
           cat /var/run/reboot-required.pkgs
         else
           echo "None"
         fi
-      register: reboot_packages
+      register: reboot_packages_before_reboot
       changed_when: false
 
     # ========================================================
-    # DISPLAY REBOOT STATUS
-    # ========================================================
-
-    - name: Display reboot status
-      ansible.builtin.debug:
-        msg:
-          - "=============================================="
-          - " REMEDIATION RESULT"
-          - "=============================================="
-          - "Host: {{ inventory_hostname }}"
-          - "Packages changed: {{ package_upgrade.changed }}"
-          - "Reboot required: {{ reboot_required.stat.exists }}"
-          - "Reboot packages:"
-          - "{{ reboot_packages.stdout }}"
-          - "=============================================="
-
-    # ========================================================
-    # OPTIONAL REBOOT
+    # 25. OPTIONAL REBOOT
     # ========================================================
 
     - name: Reboot server when required
@@ -177,35 +547,60 @@
         reboot_timeout: "{{ reboot_timeout }}"
         connect_timeout: 10
         pre_reboot_delay: 5
-        post_reboot_delay: 15
+        post_reboot_delay: 20
         test_command: uptime
       when:
         - perform_reboot | bool
-        - reboot_required.stat.exists
+        - after_reboot_required_before_reboot.stat.exists
+      register: reboot_result
+
+    - name: Set reboot execution status
+      ansible.builtin.set_fact:
+        reboot_performed: >-
+          {{
+            (
+              perform_reboot | bool
+              and after_reboot_required_before_reboot.stat.exists
+            )
+          }}
 
     # ========================================================
-    # POST-REBOOT KERNEL CHECK
+    # 26. POST-REMEDIATION INFORMATION
     # ========================================================
 
-    - name: Get current running kernel
-      ansible.builtin.command:
-        cmd: uname -r
-      register: final_kernel
-      changed_when: false
-
-    # ========================================================
-    # FINAL SECURITY UPDATE CHECK
-    # ========================================================
-
-    - name: Refresh package metadata after remediation
+    - name: Refresh APT metadata
       ansible.builtin.apt:
         update_cache: true
         cache_valid_time: 0
 
-    - name: Check remaining updates
+    - name: Get final Ubuntu release
+      ansible.builtin.shell: |
+        . /etc/os-release
+        echo "${PRETTY_NAME}"
+      register: after_os
+      changed_when: false
+
+    - name: Get final kernel
+      ansible.builtin.command:
+        cmd: uname -r
+      register: after_kernel
+      changed_when: false
+
+    - name: Get final uptime
+      ansible.builtin.command:
+      # yamllint disable-line rule:indentation
+        cmd: uptime -p
+      register: after_uptime
+      changed_when: false
+
+    # ========================================================
+    # 27. FINAL AVAILABLE UPDATES
+    # ========================================================
+
+    - name: Get remaining package updates
       ansible.builtin.shell: |
         apt list --upgradable 2>/dev/null
-      register: remaining_updates
+      register: after_updates
       changed_when: false
 
     - name: Count remaining updates
@@ -214,25 +609,439 @@
         | tail -n +2 \
         | grep -v '^$' \
         | wc -l
-      register: remaining_update_count
+      register: after_update_count
       changed_when: false
 
     # ========================================================
-    # FINAL REPORT
+    # 28. FINAL SECURITY UPDATES
     # ========================================================
 
-    - name: Display final remediation result
+    - name: Get remaining security updates
+      ansible.builtin.shell: |
+        apt list --upgradable 2>/dev/null \
+        | grep -Ei 'security|esm' || true
+      register: after_security_updates
+      changed_when: false
+
+    - name: Count remaining security updates
+      ansible.builtin.shell: |
+        apt list --upgradable 2>/dev/null \
+        | grep -Ei 'security|esm' \
+        | wc -l
+      register: after_security_count
+      changed_when: false
+
+    # ========================================================
+    # 29. FINAL REBOOT STATUS
+    # ========================================================
+
+    - name: Check final reboot requirement
+      ansible.builtin.stat:
+        path: /var/run/reboot-required
+      register: after_reboot_required
+
+    - name: Get final reboot-required packages
+      ansible.builtin.shell: |
+        if [ -f /var/run/reboot-required.pkgs ]; then
+          cat /var/run/reboot-required.pkgs
+        else
+          echo "None"
+        fi
+      register: after_reboot_packages
+      changed_when: false
+
+    # ========================================================
+    # 30. FINAL DPKG AUDIT
+    # ========================================================
+
+    - name: Final dpkg audit
+      ansible.builtin.shell: |
+        dpkg --audit
+      register: after_dpkg_audit
+      changed_when: false
+      failed_when: false
+
+    # ========================================================
+    # 31. FINAL FAILED SERVICES
+    # ========================================================
+
+    - name: Get final failed services
+      ansible.builtin.shell: |
+        systemctl --failed --no-legend --no-pager || true
+      register: after_failed_services
+      changed_when: false
+
+    # ========================================================
+    # 32. FINAL MEMORY
+    # ========================================================
+
+    - name: Get final memory usage
+      ansible.builtin.shell: |
+        free -h
+      register: after_memory
+      changed_when: false
+
+    # ========================================================
+    # 33. FINAL DISK
+    # ========================================================
+
+    - name: Get final disk usage
+      ansible.builtin.shell: |
+        df -hT
+      register: after_disk
+      changed_when: false
+
+    # ========================================================
+    # 34. FINAL LOAD
+    # ========================================================
+
+    - name: Get final system load
+      ansible.builtin.shell: |
+        uptime
+      register: after_load
+      changed_when: false
+
+    # ========================================================
+    # 35. DETERMINE RESULT
+    # ========================================================
+
+    - name: Determine remediation result
+      ansible.builtin.set_fact:
+        before_count: "{{ before_update_count.stdout | int }}"
+        after_count: "{{ after_update_count.stdout | int }}"
+        remediated_count: >-
+          {{
+            [
+              (before_update_count.stdout | int) -
+              (after_update_count.stdout | int),
+              0
+            ] | max
+          }}
+
+    - name: Determine final remediation status
+      ansible.builtin.set_fact:
+        remediation_status: >-
+          {% if after_update_count.stdout | int == 0
+             and not after_reboot_required.stat.exists %}
+          FULLY REMEDIATED
+          {% elif after_update_count.stdout | int < before_update_count.stdout | int %}
+          PARTIALLY REMEDIATED
+          {% else %}
+          REMEDIATION REQUIRES ATTENTION
+          {% endif %}
+
+    # ========================================================
+    # 36. GENERATE AFTER REPORT
+    # ========================================================
+
+    - name: Generate AFTER remediation report
+      ansible.builtin.copy:
+        dest: "{{ after_report }}"
+        owner: root
+        group: root
+        mode: "0640"
+        content: |
+          ============================================================
+          UBUNTU VULNERABILITY REMEDIATION
+          AFTER REPORT
+          ============================================================
+
+          Report ID:
+          {{ report_id }}
+
+          Hostname:
+          {{ inventory_hostname }}
+
+          IP Address:
+          {{ ansible_default_ipv4.address | default('Unknown') }}
+
+          Ubuntu:
+          {{ after_os.stdout }}
+
+          Kernel:
+          {{ after_kernel.stdout }}
+
+          Uptime:
+          {{ after_uptime.stdout }}
+
+          ============================================================
+          UPDATE RESULTS
+          ============================================================
+
+          Updates BEFORE:
+          {{ before_count }}
+
+          Updates AFTER:
+          {{ after_count }}
+
+          Updates Remediated:
+          {{ remediated_count }}
+
+          Remaining Security Updates:
+          {{ after_security_count.stdout }}
+
+          ============================================================
+          REMAINING UPDATES
+          ============================================================
+
+          {{ after_updates.stdout }}
+
+          ============================================================
+          REMAINING SECURITY UPDATES
+          ============================================================
+
+          {{ after_security_updates.stdout }}
+
+          ============================================================
+          REBOOT
+          ============================================================
+
+          Reboot Was Required Before Remediation:
+          {% if before_reboot_required.stat.exists %}
+          YES
+          {% else %}
+          NO
+          {% endif %}
+
+          Reboot Was Required After Remediation:
+          {% if after_reboot_required.stat.exists %}
+          YES
+          {% else %}
+          NO
+          {% endif %}
+
+          Reboot Performed:
+          {{ reboot_performed }}
+
+          Packages Requiring Reboot:
+          {{ after_reboot_packages.stdout }}
+
+          ============================================================
+          DPKG AUDIT
+          ============================================================
+
+          {{ after_dpkg_audit.stdout | default('No problems detected') }}
+
+          ============================================================
+          FAILED SERVICES
+          ============================================================
+
+          {{ after_failed_services.stdout | default('None') }}
+
+          ============================================================
+          MEMORY
+          ============================================================
+
+          {{ after_memory.stdout }}
+
+          ============================================================
+          DISK
+          ============================================================
+
+          {{ after_disk.stdout }}
+
+          ============================================================
+          SYSTEM LOAD
+          ============================================================
+
+          {{ after_load.stdout }}
+
+          ============================================================
+          FINAL STATUS
+          ============================================================
+
+          {{ remediation_status | trim }}
+
+          ============================================================
+          END AFTER REPORT
+          ============================================================
+      register: after_report_result
+
+    # ========================================================
+    # 37. GENERATE BEFORE/AFTER COMPARISON
+    # ========================================================
+
+    - name: Generate vulnerability comparison report
+      ansible.builtin.copy:
+        dest: "{{ comparison_report }}"
+        owner: root
+        group: root
+        mode: "0640"
+        content: |
+          ============================================================
+          UBUNTU VULNERABILITY REMEDIATION
+          BEFORE / AFTER COMPARISON
+          ============================================================
+
+          Report ID:
+          {{ report_id }}
+
+          Hostname:
+          {{ inventory_hostname }}
+
+          ============================================================
+          SYSTEM
+          ============================================================
+
+          Ubuntu BEFORE:
+          {{ before_os.stdout }}
+
+          Ubuntu AFTER:
+          {{ after_os.stdout }}
+
+          Kernel BEFORE:
+          {{ before_kernel.stdout }}
+
+          Kernel AFTER:
+          {{ after_kernel.stdout }}
+
+          ============================================================
+          PACKAGE UPDATES
+          ============================================================
+
+          Updates BEFORE:
+          {{ before_count }}
+
+          Updates AFTER:
+          {{ after_count }}
+
+          Updates Remediated:
+          {{ remediated_count }}
+
+          ============================================================
+          SECURITY UPDATES
+          ============================================================
+
+          Security Updates BEFORE:
+          {{ before_security_count.stdout }}
+
+          Security Updates AFTER:
+          {{ after_security_count.stdout }}
+
+          ============================================================
+          REBOOT
+          ============================================================
+
+          Reboot Required BEFORE:
+          {% if before_reboot_required.stat.exists %}
+          YES
+          {% else %}
+          NO
+          {% endif %}
+
+          Reboot Required AFTER:
+          {% if after_reboot_required.stat.exists %}
+          YES
+          {% else %}
+          NO
+          {% endif %}
+
+          Reboot Performed:
+          {{ reboot_performed }}
+
+          ============================================================
+          DPKG
+          ============================================================
+
+          DPKG Problems BEFORE:
+          {% if before_dpkg_audit.stdout | trim %}
+          YES
+          {% else %}
+          NO
+          {% endif %}
+
+          DPKG Problems AFTER:
+          {% if after_dpkg_audit.stdout | trim %}
+          YES
+          {% else %}
+          NO
+          {% endif %}
+
+          ============================================================
+          FAILED SERVICES
+          ============================================================
+
+          Failed Services BEFORE:
+          {% if before_failed_services.stdout | trim %}
+          YES
+          {% else %}
+          NO
+          {% endif %}
+
+          Failed Services AFTER:
+          {% if after_failed_services.stdout | trim %}
+          YES
+          {% else %}
+          NO
+          {% endif %}
+
+          ============================================================
+          RESOURCE STATUS
+          ============================================================
+
+          MEMORY BEFORE:
+          {{ before_memory.stdout }}
+
+          MEMORY AFTER:
+          {{ after_memory.stdout }}
+
+          DISK BEFORE:
+          {{ before_disk.stdout }}
+
+          DISK AFTER:
+          {{ after_disk.stdout }}
+
+          ============================================================
+          FINAL RESULT
+          ============================================================
+
+          {{ remediation_status | trim }}
+
+          ============================================================
+          REPORT FILES
+          ============================================================
+
+          BEFORE:
+          {{ before_report }}
+
+          REMEDIATION:
+          {{ remediation_report }}
+
+          AFTER:
+          {{ after_report }}
+
+          COMPARISON:
+          {{ comparison_report }}
+
+          ============================================================
+          END COMPARISON REPORT
+          ============================================================
+      register: comparison_report_result
+
+    # ========================================================
+    # 38. DISPLAY FINAL SUMMARY
+    # ========================================================
+
+    - name: Display final remediation summary
       ansible.builtin.debug:
         msg:
-          - "================================================"
-          - " UBUNTU REMEDIATION COMPLETED"
-          - "================================================"
+          - "============================================================"
+          - " UBUNTU VULNERABILITY REMEDIATION COMPLETED"
+          - "============================================================"
           - "Host: {{ inventory_hostname }}"
-          - "Ubuntu: {{ ansible_distribution }} {{ ansible_distribution_version }}"
-          - "Original Kernel: {{ ansible_kernel }}"
-          - "Current Kernel: {{ final_kernel.stdout }}"
-          - "Packages changed: {{ package_upgrade.changed }}"
-          - "Remaining updates: {{ remaining_update_count.stdout }}"
-          - "Reboot required before remediation: {{ reboot_required.stat.exists }}"
-          - "Reboot executed: {{ perform_reboot }}"
-          - "================================================"
+          - "Ubuntu: {{ after_os.stdout }}"
+          - "Kernel BEFORE: {{ before_kernel.stdout }}"
+          - "Kernel AFTER: {{ after_kernel.stdout }}"
+          - "Updates BEFORE: {{ before_count }}"
+          - "Updates AFTER: {{ after_count }}"
+          - "Updates Remediated: {{ remediated_count }}"
+          - "Security Updates BEFORE: {{ before_security_count.stdout }}"
+          - "Security Updates AFTER: {{ after_security_count.stdout }}"
+          - "Reboot Performed: {{ reboot_performed }}"
+          - "Final Status: {{ remediation_status | trim }}"
+          - "------------------------------------------------------------"
+          - "BEFORE REPORT: {{ before_report }}"
+          - "REMEDIATION REPORT: {{ remediation_report }}"
+          - "AFTER REPORT: {{ after_report }}"
+          - "COMPARISON REPORT: {{ comparison_report }}"
+          - "============================================================"
