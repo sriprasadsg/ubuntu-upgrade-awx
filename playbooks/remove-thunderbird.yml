@@ -1,0 +1,71 @@
+---
+- name: Remove Thunderbird from Ubuntu servers
+  hosts: all
+  become: true
+  gather_facts: true
+
+  tasks:
+
+    - name: Check if Thunderbird is installed via APT
+      ansible.builtin.shell: |
+        dpkg-query -W -f='${Status}' thunderbird 2>/dev/null || true
+      register: thunderbird_apt_status
+      changed_when: false
+
+    - name: Remove Thunderbird APT package
+      ansible.builtin.apt:
+        name: thunderbird
+        state: absent
+        purge: true
+        autoremove: true
+        update_cache: false
+      when: "'install ok installed' in thunderbird_apt_status.stdout"
+
+    - name: Check if Thunderbird is installed via Snap
+      ansible.builtin.command:
+        cmd: snap list thunderbird
+      register: thunderbird_snap_status
+      failed_when: false
+      changed_when: false
+
+    - name: Remove Thunderbird Snap package
+      ansible.builtin.command:
+        cmd: snap remove thunderbird
+      when: thunderbird_snap_status.rc == 0
+
+    - name: Check for Thunderbird executable
+      ansible.builtin.command:
+        cmd: which thunderbird
+      register: thunderbird_binary
+      failed_when: false
+      changed_when: false
+
+    - name: Display Thunderbird removal status
+      ansible.builtin.debug:
+        msg: >-
+          Thunderbird removal completed.
+          Thunderbird executable found: {{ thunderbird_binary.stdout
+          if thunderbird_binary.rc == 0 else 'Not found' }}
+
+    - name: Verify Thunderbird APT package is removed
+      ansible.builtin.command:
+        cmd: dpkg-query -W -f='${Status}' thunderbird
+      register: thunderbird_verify_apt
+      failed_when: false
+      changed_when: false
+
+    - name: Verify Thunderbird Snap package is removed
+      ansible.builtin.command:
+        cmd: snap list thunderbird
+      register: thunderbird_verify_snap
+      failed_when: false
+      changed_when: false
+
+    - name: Final verification
+      ansible.builtin.assert:
+        that:
+          - "'install ok installed' not in thunderbird_verify_apt.stdout"
+          - thunderbird_verify_snap.rc != 0
+          - thunderbird_binary.rc != 0
+        fail_msg: "Thunderbird is still installed or its executable is still present."
+        success_msg: "Thunderbird has been successfully removed from the Ubuntu server."
