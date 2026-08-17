@@ -1,0 +1,328 @@
+---
+- name: Install UEMS Linux Agent only when not already installed
+  hosts: all
+  become: true
+  gather_facts: true
+
+  vars:
+    # Set this to a ZIP URL when using URL-based installation.
+    # Example: https://example.com/UEMS_LinuxAgent.zip
+    uems_package_url: ""
+
+    # Optional local ZIP path on the Ansible controller.
+    uems_local_zip: ""
+
+    # Optional local installer/serverinfo files on the Ansible controller.
+    uems_local_bin: "files/UEMS_LinuxAgent.bin"
+    uems_local_serverinfo: "files/serverinfo.json"
+
+    uems_work_dir: "/var/tmp/uems-install"
+    uems_install_dir: "/usr/local"
+
+    # Optional SHA256 checksum of the ZIP downloaded from uems_package_url.
+    uems_package_checksum: ""
+
+    uems_force_install: true
+    uems_server_license: false
+    uems_domainname: ""
+
+    # Candidate service names. The playbook also searches systemd for
+    # service units containing UEMS/uems when these names are not found.
+    uems_service_candidates:
+      - uems
+      - UEMS
+      - uemsagent
+      - UEMSAgent
+      - manageengine-uems
+      - manageengine-uems-agent
+
+  pre_tasks:
+    - name: Check candidate UEMS services
+      ansible.builtin.systemd:
+        name: "{{ item }}"
+      loop: "{{ uems_service_candidates }}"
+      register: uems_candidate_services
+      failed_when: false
+      changed_when: false
+
+    - name: Discover UEMS-related systemd unit files
+      ansible.builtin.shell: |
+        set -o pipefail
+        systemctl list-unit-files --type=service --no-legend --no-pager |
+          awk '{print $1}' |
+          grep -Ei 'uems|endpoint.?central|desktop.?central|manageengine' || true
+      args:
+        executable: /bin/bash
+      register: uems_discovered_units
+      changed_when: false
+
+    - name: Build detected UEMS service list
+      ansible.builtin.set_fact:
+        uems_detected_services: >-
+          {{
+            (
+              uems_candidate_services.results
+              | selectattr('status', 'defined')
+              | selectattr('status', 'ne', {})
+              | map(attribute='item')
+              | list
+            )
+            +
+            (uems_discovered_units.stdout_lines | default([]))
+          | unique
+          }}
+
+    - name: Display detected UEMS services
+      ansible.builtin.debug:
+        msg:
+          - "Detected UEMS-related services: {{ uems_detected_services | default([]) }}"
+          - "Installation will be skipped when a UEMS service is already installed."
+
+  tasks:
+    - name: Check status of detected UEMS services
+      ansible.builtin.systemd:
+        name: "{{ item }}"
+      loop: "{{ uems_detected_services | default([]) }}"
+      register: uems_detected_status
+      failed_when: false
+      changed_when: false
+      when: (uems_detected_services | default([]) | length) > 0
+
+    - name: Determine whether UEMS is installed
+      ansible.builtin.set_fact:
+        uems_installed: "{{ (uems_detected_services | default([]) | length) > 0 }}"
+
+    - name: Display existing UEMS installation
+      ansible.builtin.debug:
+        msg: "UEMS is already installed. Skipping download and installation."
+      when: uems_installed
+
+    - name: Start and enable existing UEMS service
+      ansible.builtin.systemd:
+        name: "{{ item.item }}"
+        state: started
+        enabled: true
+        daemon_reload: true
+      loop: "{{ uems_detected_status.results | default([]) }}"
+      when:
+        - uems_installed
+        - item.status is defined
+        - item.status != {}
+        - item.status.LoadState | default('not-found') != 'not-found'
+      failed_when: false
+
+    - name: Create UEMS working directory
+      ansible.builtin.file:
+        path: "{{ uems_work_dir }}"
+        state: directory
+        owner: root
+        group: root
+        mode: "0755"
+      when: not uems_installed
+
+    - name: Download UEMS ZIP from URL
+      ansible.builtin.get_url:
+        url: "{{ uems_package_url }}"
+        dest: "{{ uems_work_dir }}/UEMS_LinuxAgent.zip"
+        mode: "0644"
+        checksum: "{{ ('sha256:' + uems_package_checksum) if uems_package_checksum | length > 0 else omit }}"
+      when:
+        - not uems_installed
+        - uems_package_url | length > 0
+      register: uems_download
+
+    - name: Copy local UEMS ZIP to target
+      ansible.builtin.copy:
+        src: "{{ uems_local_zip }}"
+        dest: "{{ uems_work_dir }}/UEMS_LinuxAgent.zip"
+        owner: root
+        group: root
+        mode: "0644"
+      when:
+        - not uems_installed
+        - uems_package_url | length == 0
+        - uems_local_zip | length > 0
+
+    - name: Extract UEMS ZIP
+      ansible.builtin.unarchive:
+        src: "{{ uems_work_dir }}/UEMS_LinuxAgent.zip"
+        dest: "{{ uems_work_dir }}/extracted"
+        remote_src: true
+        creates: "{{ uems_work_dir }}/extracted"
+      when:
+        - not uems_installed
+        - uems_package_url | length > 0 or uems_local_zip | length > 0
+
+    - name: Copy local UEMS installer
+      ansible.builtin.copy:
+        src: "{{ uems_local_bin }}"
+        dest: "{{ uems_work_dir }}/UEMS_LinuxAgent.bin"
+        owner: root
+        group: root
+        mode: "0755"
+      when:
+        - not uems_installed
+        - uems_package_url | length == 0
+        - uems_local_zip | length == 0
+        - uems_local_bin | length > 0
+
+    - name: Find UEMS installer in extracted package
+      ansible.builtin.find:
+        paths: "{{ uems_work_dir }}/extracted"
+        patterns:
+          - "UEMS_LinuxAgent.bin"
+        recurse: true
+        file_type: file
+      register: uems_bin_files
+      when:
+        - not uems_installed
+        - uems_package_url | length > 0 or uems_local_zip | length > 0
+
+    - name: Copy extracted UEMS installer to working directory
+      ansible.builtin.copy:
+        src: "{{ uems_bin_files.files[0].path }}"
+        dest: "{{ uems_work_dir }}/UEMS_LinuxAgent.bin"
+        remote_src: true
+        owner: root
+        group: root
+        mode: "0755"
+      when:
+        - not uems_installed
+        - uems_bin_files.files | default([]) | length > 0
+
+    - name: Find serverinfo.json in extracted package
+      ansible.builtin.find:
+        paths: "{{ uems_work_dir }}/extracted"
+        patterns:
+          - "serverinfo.json"
+        recurse: true
+        file_type: file
+      register: uems_serverinfo_files
+      when:
+        - not uems_installed
+        - uems_package_url | length > 0 or uems_local_zip | length > 0
+
+    - name: Copy extracted serverinfo.json beside installer
+      ansible.builtin.copy:
+        src: "{{ uems_serverinfo_files.files[0].path }}"
+        dest: "{{ uems_work_dir }}/serverinfo.json"
+        remote_src: true
+        owner: root
+        group: root
+        mode: "0644"
+      when:
+        - not uems_installed
+        - uems_serverinfo_files.files | default([]) | length > 0
+
+    - name: Copy local serverinfo.json
+      ansible.builtin.copy:
+        src: "{{ uems_local_serverinfo }}"
+        dest: "{{ uems_work_dir }}/serverinfo.json"
+        owner: root
+        group: root
+        mode: "0644"
+      when:
+        - not uems_installed
+        - uems_package_url | length == 0
+        - uems_local_zip | length == 0
+        - uems_local_bin | length > 0
+
+    - name: Verify UEMS installer exists
+      ansible.builtin.stat:
+        path: "{{ uems_work_dir }}/UEMS_LinuxAgent.bin"
+      register: uems_bin_stat
+      when: not uems_installed
+
+    - name: Verify serverinfo.json exists
+      ansible.builtin.stat:
+        path: "{{ uems_work_dir }}/serverinfo.json"
+      register: uems_serverinfo_stat
+      when: not uems_installed
+
+    - name: Fail if UEMS installer is missing
+      ansible.builtin.fail:
+        msg: >-
+          UEMS_LinuxAgent.bin was not found. Provide uems_package_url,
+          uems_local_zip, or uems_local_bin.
+      when:
+        - not uems_installed
+        - not uems_bin_stat.stat.exists
+
+    - name: Fail if serverinfo.json is missing
+      ansible.builtin.fail:
+        msg: >-
+          serverinfo.json was not found. The UEMS installer requires it
+          beside UEMS_LinuxAgent.bin.
+      when:
+        - not uems_installed
+        - not uems_serverinfo_stat.stat.exists
+
+    - name: Install UEMS Linux Agent
+      ansible.builtin.command:
+        cmd: >-
+          ./UEMS_LinuxAgent.bin
+          -d {{ uems_install_dir }}
+          {% if uems_force_install %}-f{% endif %}
+          {% if uems_server_license %}-s{% endif %}
+          {% if uems_domainname | length > 0 %}-a {{ uems_domainname }}{% endif %}
+        chdir: "{{ uems_work_dir }}"
+      register: uems_install_result
+      when: not uems_installed
+      changed_when: true
+
+    - name: Refresh systemd after UEMS installation
+      ansible.builtin.systemd:
+        daemon_reload: true
+      when: not uems_installed
+
+    - name: Discover UEMS service after installation
+      ansible.builtin.shell: |
+        set -o pipefail
+        systemctl list-unit-files --type=service --no-legend --no-pager |
+          awk '{print $1}' |
+          grep -Ei 'uems|endpoint.?central|desktop.?central|manageengine' || true
+      args:
+        executable: /bin/bash
+      register: uems_post_install_services
+      changed_when: false
+      when: not uems_installed
+
+    - name: Start detected UEMS service after installation
+      ansible.builtin.systemd:
+        name: "{{ item }}"
+        state: started
+        enabled: true
+      loop: "{{ uems_post_install_services.stdout_lines | default([]) }}"
+      when:
+        - not uems_installed
+        - uems_post_install_services.stdout_lines | default([]) | length > 0
+
+    - name: Verify UEMS service after installation
+      ansible.builtin.shell: |
+        systemctl list-unit-files --type=service --no-legend --no-pager |
+          awk '{print $1}' |
+          grep -Ei 'uems|endpoint.?central|desktop.?central|manageengine'
+      args:
+        executable: /bin/bash
+      register: uems_final_check
+      changed_when: false
+      failed_when: false
+
+    - name: Display final UEMS result
+      ansible.builtin.debug:
+        msg:
+          - "UEMS services detected: {{ uems_final_check.stdout_lines | default([]) }}"
+          - >-
+            {{
+              'Existing UEMS installation detected; installation was skipped.'
+              if uems_installed
+              else 'UEMS installation process completed.'
+            }}
+
+    - name: Remove temporary UEMS files
+      ansible.builtin.file:
+        path: "{{ uems_work_dir }}"
+        state: absent
+      when:
+        - not uems_installed
+        
