@@ -40,7 +40,7 @@
     # Set this to the ZIP download URL when installing from a URL.
     # Example:
     # uems_package_url: "https://download.example.com/UEMS_LinuxAgent.zip"
-    uems_package_url: ""
+    uems_package_url: "http://192.168.10.10/Softwares/DefaultRemoteOffice_UEMSLinuxAgent.zip"
 
     # If uems_package_url is empty, this local ZIP is used.
     # Place it in: <playbook_directory>/files/
