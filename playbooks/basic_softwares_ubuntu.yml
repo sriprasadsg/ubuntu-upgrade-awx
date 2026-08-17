@@ -1,0 +1,937 @@
+---
+# ================================================================
+# Ubuntu Enterprise Security Stack
+# Production-Ready Ansible Playbook
+# ================================================================
+#
+# Components:
+#   1. Wazuh Agent
+#   2. Zabbix Agent 2
+#   3. Seqrite Antivirus
+#   4. Auditd
+#   5. Chrony
+#   6. Rsyslog
+#   7. Unattended Upgrades
+#   8. Enterprise administration utilities
+#
+# Workflow:
+#
+#   DETECT
+#      |
+#      v
+#   INSTALL IF MISSING
+#      |
+#      v
+#   CONFIGURE
+#      |
+#      v
+#   ENABLE + START SERVICE
+#      |
+#      v
+#   VERIFY SERVICE
+#      |
+#      v
+#   VERIFY VERSION
+#      |
+#      v
+#   FINAL HEALTH REPORT
+#
+# Supported:
+#   Ubuntu 22.04
+#   Ubuntu 24.04
+#
+# ================================================================
+
+- name: Ubuntu Enterprise Security Stack
+  hosts: ubuntu_servers
+  become: true
+  gather_facts: true
+
+  vars:
+
+    # ============================================================
+    # GENERAL SETTINGS
+    # ============================================================
+
+    minimum_disk_space_gb: 2
+
+    # Do NOT perform a full OS upgrade during agent deployment.
+    # Patch management is intentionally separated.
+    perform_os_upgrade: false
+
+    # Reboot automatically if /var/run/reboot-required exists?
+    auto_reboot: false
+
+    # ============================================================
+    # WAZUH
+    # ============================================================
+
+    wazuh_enabled: true
+
+    wazuh_manager_ip: "192.168.10.100"
+    wazuh_manager_port: 1514
+    wazuh_registration_port: 1515
+
+    wazuh_agent_group: "ubuntu-servers"
+
+    # Leave empty when enrollment password is not required.
+    wazuh_enrollment_password: ""
+
+    # ============================================================
+    # ZABBIX
+    # ============================================================
+
+    zabbix_enabled: true
+
+    zabbix_server_ip: "192.168.10.101"
+    zabbix_server_port: 10051
+
+    zabbix_version: "7.0"
+
+    # ============================================================
+    # SEQRITE
+    # ============================================================
+
+    seqrite_enabled: true
+
+    # IMPORTANT:
+    # Replace this with your approved Seqrite Linux installer.
+    seqrite_download_url: ""
+
+    seqrite_download_dir: "/opt/seqrite-installer"
+
+    seqrite_package_name: "seqrite-agent.deb"
+
+    # ============================================================
+    # PATCH MANAGEMENT
+    # ============================================================
+
+    patch_management_enabled: true
+
+    unattended_security_updates: true
+
+    # ============================================================
+    # REQUIRED PACKAGES
+    # ============================================================
+
+    enterprise_packages:
+
+      - apt-transport-https
+      - ca-certificates
+      - curl
+      - wget
+      - gnupg
+      - software-properties-common
+      - unzip
+      - zip
+      - jq
+      - vim
+      - nano
+      - net-tools
+      - lsof
+      - rsync
+      - git
+      - sudo
+      - openssh-client
+      - python3
+      - python3-apt
+      - bash-completion
+      - logrotate
+      - rsyslog
+      - chrony
+      - auditd
+      - audispd-plugins
+      - unattended-upgrades
+      - apt-listchanges
+
+  # ==============================================================
+  # FACT COLLECTION / DETECTION
+  # ==============================================================
+
+  tasks:
+
+    - name: Display server information
+      ansible.builtin.debug:
+        msg:
+          - "================================================="
+          - "SERVER DETECTION"
+          - "================================================="
+          - "Hostname       : {{ ansible_hostname }}"
+          - "FQDN           : {{ ansible_fqdn }}"
+          - "OS             : {{ ansible_distribution }}"
+          - "OS Version     : {{ ansible_distribution_version }}"
+          - "Kernel         : {{ ansible_kernel }}"
+          - "Architecture   : {{ ansible_architecture }}"
+          - "Primary IP     : {{ ansible_default_ipv4.address | default('N/A') }}"
+          - "CPU Cores      : {{ ansible_processor_vcpus | default('N/A') }}"
+          - "RAM            : {{ ansible_memtotal_mb }} MB"
+          - "================================================="
+
+    - name: Verify operating system
+      ansible.builtin.assert:
+        that:
+          - ansible_distribution == "Ubuntu"
+          - ansible_distribution_major_version in ["22", "24"]
+        fail_msg: >
+          Unsupported operating system.
+          This playbook supports Ubuntu 22.04 and Ubuntu 24.04.
+
+    # ============================================================
+    # DISK SPACE CHECK
+    # ============================================================
+
+    - name: Check root filesystem
+      ansible.builtin.shell:
+        cmd: "df -BG / --output=avail | tail -1 | tr -dc '0-9'"
+      register: root_disk_free
+      changed_when: false
+
+    - name: Verify minimum disk space
+      ansible.builtin.assert:
+        that:
+          - root_disk_free.stdout | int >= minimum_disk_space_gb
+        fail_msg: >
+          Insufficient disk space on /.
+          Required minimum: {{ minimum_disk_space_gb }} GB.
+          Available: {{ root_disk_free.stdout }} GB.
+
+    # ============================================================
+    # APT CACHE
+    # ============================================================
+
+    - name: Update APT cache
+      ansible.builtin.apt:
+        update_cache: true
+        cache_valid_time: 3600
+
+    # ============================================================
+    # DETECT WAZUH
+    # ============================================================
+
+    - name: Detect Wazuh Agent
+      ansible.builtin.shell:
+        cmd: "dpkg-query -W -f='${Status}' wazuh-agent 2>/dev/null"
+      register: wazuh_detect
+      changed_when: false
+      failed_when: false
+      when: wazuh_enabled
+
+    - name: Set Wazuh installation status
+      ansible.builtin.set_fact:
+        wazuh_installed: >-
+          {{
+            wazuh_detect.rc == 0 and
+            'install ok installed' in wazuh_detect.stdout
+          }}
+      when: wazuh_enabled
+
+    - name: Display Wazuh detection result
+      ansible.builtin.debug:
+        msg: "Wazuh Agent installed: {{ wazuh_installed | default(false) }}"
+      when: wazuh_enabled
+
+    # ============================================================
+    # DETECT ZABBIX
+    # ============================================================
+
+    - name: Detect Zabbix Agent 2
+      ansible.builtin.shell:
+        cmd: "dpkg-query -W -f='${Status}' zabbix-agent2 2>/dev/null"
+      register: zabbix_detect
+      changed_when: false
+      failed_when: false
+      when: zabbix_enabled
+
+    - name: Set Zabbix installation status
+      ansible.builtin.set_fact:
+        zabbix_installed: >-
+          {{
+            zabbix_detect.rc == 0 and
+            'install ok installed' in zabbix_detect.stdout
+          }}
+      when: zabbix_enabled
+
+    - name: Display Zabbix detection result
+      ansible.builtin.debug:
+        msg: "Zabbix Agent 2 installed: {{ zabbix_installed | default(false) }}"
+      when: zabbix_enabled
+
+    # ============================================================
+    # DETECT SEQRITE
+    # ============================================================
+
+    - name: Detect Seqrite
+      ansible.builtin.shell:
+        cmd: |
+          dpkg-query -W -f='${Package} ${Status}\n' 2>/dev/null |
+          grep -Ei 'seqrite|quick.?heal' || true
+      register: seqrite_detect
+      changed_when: false
+      when: seqrite_enabled
+
+    - name: Set Seqrite installation status
+      ansible.builtin.set_fact:
+        seqrite_installed: "{{ seqrite_detect.stdout | trim != '' }}"
+      when: seqrite_enabled
+
+    - name: Display Seqrite detection result
+      ansible.builtin.debug:
+        msg: "Seqrite installed: {{ seqrite_installed | default(false) }}"
+      when: seqrite_enabled
+
+    # ============================================================
+    # INSTALL COMMON PACKAGES
+    # ============================================================
+
+    - name: Install enterprise required packages
+      ansible.builtin.apt:
+        name: "{{ enterprise_packages }}"
+        state: present
+
+    # ============================================================
+    # CHRONY CONFIGURATION
+    # ============================================================
+
+    - name: Verify Chrony package
+      ansible.builtin.apt:
+        name: chrony
+        state: present
+
+    - name: Enable Chrony
+      ansible.builtin.systemd:
+        name: chrony
+        enabled: true
+        state: started
+
+    # ============================================================
+    # RSYSLOG CONFIGURATION
+    # ============================================================
+
+    - name: Verify Rsyslog package
+      ansible.builtin.apt:
+        name: rsyslog
+        state: present
+
+    - name: Enable Rsyslog
+      ansible.builtin.systemd:
+        name: rsyslog
+        enabled: true
+        state: started
+
+    # ============================================================
+    # AUDITD CONFIGURATION
+    # ============================================================
+
+    - name: Verify Auditd package
+      ansible.builtin.apt:
+        name: auditd
+        state: present
+
+    - name: Enable Auditd
+      ansible.builtin.systemd:
+        name: auditd
+        enabled: true
+        state: started
+
+    # ============================================================
+    # WAZUH REPOSITORY
+    # ============================================================
+
+    - name: Install Wazuh GPG key
+      ansible.builtin.get_url:
+        url: "https://packages.wazuh.com/key/GPG-KEY-WAZUH"
+        dest: "/usr/share/keyrings/wazuh.gpg"
+        mode: "0644"
+      when:
+        - wazuh_enabled
+        - not wazuh_installed
+
+    - name: Configure Wazuh repository
+      ansible.builtin.apt_repository:
+        repo: "deb [signed-by=/usr/share/keyrings/wazuh.gpg] https://packages.wazuh.com/4.x/apt/ stable main"
+        filename: wazuh
+        state: present
+      when:
+        - wazuh_enabled
+        - not wazuh_installed
+
+    - name: Update APT after Wazuh repository
+      ansible.builtin.apt:
+        update_cache: true
+      when:
+        - wazuh_enabled
+        - not wazuh_installed
+
+    # ============================================================
+    # INSTALL WAZUH ONLY IF MISSING
+    # ============================================================
+
+    - name: Install Wazuh Agent
+      ansible.builtin.apt:
+        name: wazuh-agent
+        state: present
+      environment:
+        WAZUH_MANAGER: "{{ wazuh_manager_ip }}"
+        WAZUH_MANAGER_PORT: "{{ wazuh_manager_port }}"
+        WAZUH_REGISTRATION_SERVER: "{{ wazuh_manager_ip }}"
+        WAZUH_REGISTRATION_PORT: "{{ wazuh_registration_port }}"
+        WAZUH_AGENT_GROUP: "{{ wazuh_agent_group }}"
+      when:
+        - wazuh_enabled
+        - not wazuh_installed
+
+    # ============================================================
+    # WAZUH CONFIGURATION
+    # ============================================================
+
+    - name: Configure Wazuh Manager
+      ansible.builtin.replace:
+        path: /var/ossec/etc/ossec.conf
+        regexp: '<address>.*?</address>'
+        replace: "<address>{{ wazuh_manager_ip }}</address>"
+      when: wazuh_enabled
+      notify: Restart Wazuh
+
+    - name: Configure Wazuh Manager port
+      ansible.builtin.replace:
+        path: /var/ossec/etc/ossec.conf
+        regexp: '<port>1514</port>'
+        replace: "<port>{{ wazuh_manager_port }}</port>"
+      when: wazuh_enabled
+      notify: Restart Wazuh
+
+    # ============================================================
+    # WAZUH SERVICE
+    # ============================================================
+
+    - name: Enable Wazuh Agent
+      ansible.builtin.systemd:
+        name: wazuh-agent
+        enabled: true
+        state: started
+      when: wazuh_enabled
+
+    # ============================================================
+    # WAZUH VERSION
+    # ============================================================
+
+    - name: Get Wazuh version
+      ansible.builtin.shell:
+        cmd: "/var/ossec/bin/wazuh-control info 2>/dev/null | head -1 || dpkg-query -W -f='${Version}' wazuh-agent"
+      register: wazuh_version_result
+      changed_when: false
+      failed_when: false
+      when: wazuh_enabled
+
+    # ============================================================
+    # ZABBIX REPOSITORY
+    # ============================================================
+
+    - name: Download Zabbix repository package
+      ansible.builtin.get_url:
+        url: "https://repo.zabbix.com/zabbix/{{ zabbix_version }}/release/ubuntu/pool/main/z/zabbix-release/zabbix-release_latest_{{ zabbix_version }}+ubuntu{{ ansible_distribution_version | replace('.', '') }}_all.deb"
+        dest: "/tmp/zabbix-release.deb"
+        mode: "0644"
+      when:
+        - zabbix_enabled
+        - not zabbix_installed
+
+    - name: Install Zabbix repository
+      ansible.builtin.apt:
+        deb: "/tmp/zabbix-release.deb"
+      when:
+        - zabbix_enabled
+        - not zabbix_installed
+
+    - name: Update APT after Zabbix repository
+      ansible.builtin.apt:
+        update_cache: true
+      when:
+        - zabbix_enabled
+        - not zabbix_installed
+
+    # ============================================================
+    # INSTALL ZABBIX ONLY IF MISSING
+    # ============================================================
+
+    - name: Install Zabbix Agent 2
+      ansible.builtin.apt:
+        name: zabbix-agent2
+        state: present
+      when:
+        - zabbix_enabled
+        - not zabbix_installed
+
+    # ============================================================
+    # ZABBIX CONFIGURATION
+    # ============================================================
+
+    - name: Configure Zabbix Server
+      ansible.builtin.lineinfile:
+        path: /etc/zabbix/zabbix_agent2.conf
+        regexp: '^#?\s*Server='
+        line: "Server={{ zabbix_server_ip }}"
+      when: zabbix_enabled
+      notify: Restart Zabbix
+
+    - name: Configure Zabbix Active Server
+      ansible.builtin.lineinfile:
+        path: /etc/zabbix/zabbix_agent2.conf
+        regexp: '^#?\s*ServerActive='
+        line: "ServerActive={{ zabbix_server_ip }}:{{ zabbix_server_port }}"
+      when: zabbix_enabled
+      notify: Restart Zabbix
+
+    - name: Configure Zabbix Hostname
+      ansible.builtin.lineinfile:
+        path: /etc/zabbix/zabbix_agent2.conf
+        regexp: '^#?\s*Hostname='
+        line: "Hostname={{ ansible_hostname }}"
+      when: zabbix_enabled
+      notify: Restart Zabbix
+
+    # ============================================================
+    # ZABBIX SERVICE
+    # ============================================================
+
+    - name: Enable Zabbix Agent 2
+      ansible.builtin.systemd:
+        name: zabbix-agent2
+        enabled: true
+        state: started
+      when: zabbix_enabled
+
+    # ============================================================
+    # ZABBIX VERSION
+    # ============================================================
+
+    - name: Get Zabbix version
+      ansible.builtin.shell:
+        cmd: "zabbix_agent2 -V 2>/dev/null | head -1"
+      register: zabbix_version_result
+      changed_when: false
+      failed_when: false
+      when: zabbix_enabled
+
+    # ============================================================
+    # SEQRITE INSTALLATION
+    # ============================================================
+
+    - name: Validate Seqrite installer URL
+      ansible.builtin.assert:
+        that:
+          - seqrite_download_url | length > 0
+        fail_msg: >
+          Seqrite is enabled but seqrite_download_url is empty.
+          Set the URL to your approved Seqrite Linux installer.
+      when:
+        - seqrite_enabled
+        - not seqrite_installed
+
+    - name: Create Seqrite directory
+      ansible.builtin.file:
+        path: "{{ seqrite_download_dir }}"
+        state: directory
+        owner: root
+        group: root
+        mode: "0755"
+      when:
+        - seqrite_enabled
+        - not seqrite_installed
+
+    - name: Download Seqrite installer
+      ansible.builtin.get_url:
+        url: "{{ seqrite_download_url }}"
+        dest: "{{ seqrite_download_dir }}/{{ seqrite_package_name }}"
+        mode: "0755"
+      when:
+        - seqrite_enabled
+        - not seqrite_installed
+
+    - name: Install Seqrite DEB
+      ansible.builtin.apt:
+        deb: "{{ seqrite_download_dir }}/{{ seqrite_package_name }}"
+        state: present
+      when:
+        - seqrite_enabled
+        - not seqrite_installed
+        - seqrite_package_name is search('\.deb$')
+
+    # ============================================================
+    # SEQRITE SERVICE DETECTION
+    # ============================================================
+
+    - name: Detect Seqrite service
+      ansible.builtin.shell:
+        cmd: |
+          systemctl list-unit-files --type=service --no-legend |
+          awk '{print $1}' |
+          grep -Ei 'seqrite|quick.?heal' |
+          head -1
+      register: seqrite_service_detect
+      changed_when: false
+      failed_when: false
+      when: seqrite_enabled
+
+    - name: Set Seqrite service name
+      ansible.builtin.set_fact:
+        seqrite_service_name: "{{ seqrite_service_detect.stdout | trim }}"
+      when:
+        - seqrite_enabled
+        - seqrite_service_detect.stdout | trim != ""
+
+    - name: Enable Seqrite service
+      ansible.builtin.systemd:
+        name: "{{ seqrite_service_name }}"
+        enabled: true
+        state: started
+      when:
+        - seqrite_enabled
+        - seqrite_service_name is defined
+        - seqrite_service_name | length > 0
+
+    # ============================================================
+    # SEQRITE VERSION
+    # ============================================================
+
+    - name: Get Seqrite package version
+      ansible.builtin.shell:
+        cmd: |
+          dpkg-query -W -f='${Package} ${Version}\n' 2>/dev/null |
+          grep -Ei 'seqrite|quick.?heal' |
+          head -1
+      register: seqrite_version_result
+      changed_when: false
+      failed_when: false
+      when: seqrite_enabled
+
+    # ============================================================
+    # PATCH MANAGEMENT
+    # ============================================================
+
+    - name: Configure automatic update schedule
+      ansible.builtin.copy:
+        dest: /etc/apt/apt.conf.d/20auto-upgrades
+        owner: root
+        group: root
+        mode: "0644"
+        content: |
+          APT::Periodic::Update-Package-Lists "1";
+          APT::Periodic::Download-Upgradeable-Packages "1";
+          APT::Periodic::AutocleanInterval "7";
+          APT::Periodic::Unattended-Upgrade "1";
+      when:
+        - patch_management_enabled
+        - unattended_security_updates
+
+    - name: Configure security unattended upgrades
+      ansible.builtin.copy:
+        dest: /etc/apt/apt.conf.d/52unattended-upgrades
+        owner: root
+        group: root
+        mode: "0644"
+        content: |
+          Unattended-Upgrade::Origins-Pattern {
+              "origin=Ubuntu,archive=${distro_codename}-security";
+          };
+
+          Unattended-Upgrade::Remove-Unused-Dependencies "true";
+
+          Unattended-Upgrade::Automatic-Reboot "false";
+      when:
+        - patch_management_enabled
+        - unattended_security_updates
+
+    # ============================================================
+    # PATCH STATUS
+    # ============================================================
+
+    - name: Refresh package information
+      ansible.builtin.apt:
+        update_cache: true
+      when: patch_management_enabled
+
+    - name: Check pending updates
+      ansible.builtin.shell:
+        cmd: |
+          apt list --upgradable 2>/dev/null |
+          tail -n +2 |
+          wc -l
+      register: pending_updates
+      changed_when: false
+      when: patch_management_enabled
+
+    # ============================================================
+    # OPTIONAL PATCHING
+    # ============================================================
+    #
+    # IMPORTANT:
+    # perform_os_upgrade defaults to false.
+    #
+    # Enable separately when you intentionally want
+    # Ansible to patch the server.
+    #
+
+    - name: Perform OS upgrade
+      ansible.builtin.apt:
+        upgrade: dist
+        autoremove: true
+        autoclean: true
+      when:
+        - patch_management_enabled
+        - perform_os_upgrade
+
+    # ============================================================
+    # REBOOT DETECTION
+    # ============================================================
+
+    - name: Check reboot requirement
+      ansible.builtin.stat:
+        path: /var/run/reboot-required
+      register: reboot_required
+
+    - name: Display reboot requirement
+      ansible.builtin.debug:
+        msg: "Reboot required: {{ reboot_required.stat.exists }}"
+
+    - name: Reboot server when configured
+      ansible.builtin.reboot:
+        msg: "Ubuntu Enterprise Security Stack requested reboot."
+        reboot_timeout: 900
+        connect_timeout: 30
+        test_command: "uptime"
+      when:
+        - reboot_required.stat.exists
+        - auto_reboot
+
+    # ============================================================
+    # FINAL SERVICE DETECTION
+    # ============================================================
+
+    - name: Get Wazuh service status
+      ansible.builtin.command:
+        cmd: systemctl is-active wazuh-agent
+      register: wazuh_service_status
+      changed_when: false
+      failed_when: false
+      when: wazuh_enabled
+
+    - name: Get Zabbix service status
+      ansible.builtin.command:
+        cmd: systemctl is-active zabbix-agent2
+      register: zabbix_service_status
+      changed_when: false
+      failed_when: false
+      when: zabbix_enabled
+
+    - name: Get Chrony service status
+      ansible.builtin.command:
+        cmd: systemctl is-active chrony
+      register: chrony_service_status
+      changed_when: false
+      failed_when: false
+
+    - name: Get Rsyslog service status
+      ansible.builtin.command:
+        cmd: systemctl is-active rsyslog
+      register: rsyslog_service_status
+      changed_when: false
+      failed_when: false
+
+    - name: Get Auditd service status
+      ansible.builtin.command:
+        cmd: systemctl is-active auditd
+      register: auditd_service_status
+      changed_when: false
+      failed_when: false
+
+    # ============================================================
+    # FINAL PACKAGE VERIFICATION
+    # ============================================================
+
+    - name: Verify Wazuh package
+      ansible.builtin.shell:
+        cmd: "dpkg-query -W -f='${Version}' wazuh-agent 2>/dev/null || echo NOT_INSTALLED"
+      register: wazuh_final_version
+      changed_when: false
+      when: wazuh_enabled
+
+    - name: Verify Zabbix package
+      ansible.builtin.shell:
+        cmd: "dpkg-query -W -f='${Version}' zabbix-agent2 2>/dev/null || echo NOT_INSTALLED"
+      register: zabbix_final_version
+      changed_when: false
+      when: zabbix_enabled
+
+    - name: Verify Auditd package
+      ansible.builtin.shell:
+        cmd: "dpkg-query -W -f='${Version}' auditd 2>/dev/null || echo NOT_INSTALLED"
+      register: auditd_final_version
+      changed_when: false
+
+    - name: Verify Chrony package
+      ansible.builtin.shell:
+        cmd: "dpkg-query -W -f='${Version}' chrony 2>/dev/null || echo NOT_INSTALLED"
+      register: chrony_final_version
+      changed_when: false
+
+    - name: Verify Rsyslog package
+      ansible.builtin.shell:
+        cmd: "dpkg-query -W -f='${Version}' rsyslog 2>/dev/null || echo NOT_INSTALLED"
+      register: rsyslog_final_version
+      changed_when: false
+
+    # ============================================================
+    # FINAL HEALTH CALCULATION
+    # ============================================================
+
+    - name: Calculate Wazuh health
+      ansible.builtin.set_fact:
+        wazuh_health: >-
+          {{
+            'HEALTHY'
+            if
+              (
+                not wazuh_enabled
+                or
+                (
+                  wazuh_service_status.rc == 0
+                  and
+                  wazuh_final_version.stdout != 'NOT_INSTALLED'
+                )
+              )
+            else 'FAILED'
+          }}
+
+    - name: Calculate Zabbix health
+      ansible.builtin.set_fact:
+        zabbix_health: >-
+          {{
+            'HEALTHY'
+            if
+              (
+                not zabbix_enabled
+                or
+                (
+                  zabbix_service_status.rc == 0
+                  and
+                  zabbix_final_version.stdout != 'NOT_INSTALLED'
+                )
+              )
+            else 'FAILED'
+          }}
+
+    - name: Calculate Seqrite health
+      ansible.builtin.set_fact:
+        seqrite_health: >-
+          {{
+            'HEALTHY'
+            if
+              (
+                not seqrite_enabled
+                or
+                seqrite_installed
+              )
+            else 'FAILED'
+          }}
+
+    - name: Calculate system service health
+      ansible.builtin.set_fact:
+        system_services_health: >-
+          {{
+            'HEALTHY'
+            if
+              (
+                chrony_service_status.rc == 0
+                and
+                rsyslog_service_status.rc == 0
+                and
+                auditd_service_status.rc == 0
+              )
+            else 'FAILED'
+          }}
+
+    # ============================================================
+    # FINAL ENTERPRISE HEALTH REPORT
+    # ============================================================
+
+    - name: Enterprise security stack health report
+      ansible.builtin.debug:
+        msg:
+          - ""
+          - "=============================================================="
+          - "        UBUNTU ENTERPRISE SECURITY HEALTH REPORT"
+          - "=============================================================="
+          - ""
+          - "SERVER"
+          - "--------------------------------------------------------------"
+          - "Hostname              : {{ ansible_hostname }}"
+          - "FQDN                  : {{ ansible_fqdn }}"
+          - "IP Address            : {{ ansible_default_ipv4.address | default('N/A') }}"
+          - "Operating System      : {{ ansible_distribution }} {{ ansible_distribution_version }}"
+          - "Kernel                : {{ ansible_kernel }}"
+          - "Architecture          : {{ ansible_architecture }}"
+          - ""
+          - "SECURITY AGENTS"
+          - "--------------------------------------------------------------"
+          - "Wazuh Enabled         : {{ wazuh_enabled }}"
+          - "Wazuh Health          : {{ wazuh_health | default('N/A') }}"
+          - "Wazuh Version         : {{ wazuh_final_version.stdout | default('N/A') }}"
+          - "Wazuh Service         : {{ wazuh_service_status.stdout | default('N/A') }}"
+          - ""
+          - "Zabbix Enabled        : {{ zabbix_enabled }}"
+          - "Zabbix Health         : {{ zabbix_health | default('N/A') }}"
+          - "Zabbix Version        : {{ zabbix_final_version.stdout | default('N/A') }}"
+          - "Zabbix Service        : {{ zabbix_service_status.stdout | default('N/A') }}"
+          - ""
+          - "Seqrite Enabled       : {{ seqrite_enabled }}"
+          - "Seqrite Health        : {{ seqrite_health | default('N/A') }}"
+          - "Seqrite Version       : {{ seqrite_version_result.stdout | default('N/A') }}"
+          - "Seqrite Service       : {{ seqrite_service_name | default('UNKNOWN') }}"
+          - ""
+          - "SYSTEM SECURITY"
+          - "--------------------------------------------------------------"
+          - "Auditd Version        : {{ auditd_final_version.stdout }}"
+          - "Auditd Service        : {{ auditd_service_status.stdout }}"
+          - "Chrony Version        : {{ chrony_final_version.stdout }}"
+          - "Chrony Service        : {{ chrony_service_status.stdout }}"
+          - "Rsyslog Version       : {{ rsyslog_final_version.stdout }}"
+          - "Rsyslog Service       : {{ rsyslog_service_status.stdout }}"
+          - "System Services       : {{ system_services_health }}"
+          - ""
+          - "PATCH MANAGEMENT"
+          - "--------------------------------------------------------------"
+          - "Patch Management      : {{ patch_management_enabled }}"
+          - "Auto Security Updates : {{ unattended_security_updates }}"
+          - "Pending Updates       : {{ pending_updates.stdout | default('N/A') }}"
+          - "Reboot Required       : {{ reboot_required.stat.exists }}"
+          - ""
+          - "=============================================================="
+          - "FINAL STATUS"
+          - "=============================================================="
+          - "Wazuh                : {{ wazuh_health | default('N/A') }}"
+          - "Zabbix               : {{ zabbix_health | default('N/A') }}"
+          - "Seqrite              : {{ seqrite_health | default('N/A') }}"
+          - "System Services      : {{ system_services_health }}"
+          - "=============================================================="
+          - ""
+
+  # ==============================================================
+  # HANDLERS
+  # ==============================================================
+
+  handlers:
+
+    - name: Restart Wazuh
+      ansible.builtin.systemd:
+        name: wazuh-agent
+        state: restarted
+        enabled: true
+
+    - name: Restart Zabbix
+      ansible.builtin.systemd:
+        name: zabbix-agent2
+        state: restarted
+        enabled: true
+
+
