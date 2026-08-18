@@ -96,7 +96,7 @@
 
     # IMPORTANT:
     # Replace this with your approved Seqrite Linux installer.
-    seqrite_download_url: ""
+    seqrite_download_url: "http://192.168.10.10/Softwares/DefaultRemoteOffice_UEMSLinuxAgent.zip"
 
     seqrite_download_dir: "/opt/seqrite-installer"
 
