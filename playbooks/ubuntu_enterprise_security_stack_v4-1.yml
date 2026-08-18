@@ -30,7 +30,7 @@
 # ============================================================================
 
 - name: Ubuntu Enterprise Security Stack v4
-  hosts: ubuntu_servers
+  hosts: all
   become: true
   gather_facts: true
 
