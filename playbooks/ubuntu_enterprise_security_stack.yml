@@ -22,7 +22,7 @@
 # ============================================================================
 
 - name: Ubuntu Enterprise Security Stack
-  hosts: ubuntu_servers
+  hosts: all
   become: true
   gather_facts: true
 
