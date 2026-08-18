@@ -1,51 +1,38 @@
 ---
-# ================================================================
+# =====================================================================
 # Ubuntu Enterprise Security Stack
-# ================================================================
-#
-# Components:
-#   1. ManageEngine Endpoint Central / UEMS Linux Agent
-#   2. Wazuh Agent
-#   3. Zabbix Agent 2
-#   4. Auditd
-#   5. Chrony
-#   6. Rsyslog
-#   7. Unattended Security Updates
+# =====================================================================
 #
 # Workflow:
 #
-#   DETECT
-#      |
-#      v
-#   INVENTORY
-#      |
-#      v
-#   INSTALL ONLY IF MISSING
-#      |
-#      v
-#   CONFIGURE
-#      |
-#      v
-#   START / ENABLE SERVICES
-#      |
-#      v
-#   VERSION VERIFICATION
-#      |
-#      v
-#   HEALTH CHECK
-#      |
-#      v
-#   PATCH STATUS
-#      |
-#      v
-#   FINAL REPORT
+# DETECT
+#   |
+#   +--> UEMS / ManageEngine Endpoint Central
+#   +--> Wazuh Agent
+#   +--> Zabbix Agent / Agent 2
+#   +--> Auditd
+#   +--> Chrony
+#   +--> Rsyslog
+#   |
+# INSTALL ONLY IF MISSING
+#   |
+# CONFIGURE
+#   |
+# SERVICE VERIFICATION
+#   |
+# VERSION VERIFICATION
+#   |
+# PATCH STATUS
+#   |
+# COMPLETE SOFTWARE INVENTORY
+#   |
+# FINAL HEALTH REPORT
 #
-# Tested design target:
+# Supported:
 #   Ubuntu 22.04
 #   Ubuntu 24.04
 #
-# ================================================================
-
+# =====================================================================
 
 - name: Ubuntu Enterprise Security Stack
   hosts: all
@@ -54,51 +41,46 @@
 
   vars:
 
-    # ============================================================
-    # GENERAL SETTINGS
-    # ============================================================
+    # =================================================================
+    # GENERAL
+    # =================================================================
 
     minimum_disk_space_gb: 2
 
-    # IMPORTANT:
-    # false = only configure automatic security patching.
-    # true  = perform apt dist-upgrade.
+    # false = do not perform full package upgrade
+    # true  = apt dist-upgrade
     perform_os_upgrade: false
 
-    # Automatically reboot after patching.
+    # Do not automatically reboot production servers
     auto_reboot: false
 
 
-    # ============================================================
-    # UEMS / ENDPOINT CENTRAL
-    # ============================================================
+    # =================================================================
+    # UEMS / MANAGEENGINE ENDPOINT CENTRAL
+    # =================================================================
 
     uems_enabled: true
 
-    # Internal software repository
     uems_download_url: "http://192.168.10.10/Softwares/DefaultRemoteOffice_UEMSLinuxAgent.zip"
 
     uems_download_dir: "/opt/uems-installer"
 
     uems_archive_name: "DefaultRemoteOffice_UEMSLinuxAgent.zip"
 
-    # Vendor documented default installation directory
     uems_install_dir: "/usr/local/desktopcentralagent"
 
-    # Installer supplied inside ZIP
     uems_installer_name: "UEMS_LinuxAgent.bin"
 
-    # Property file supplied inside ZIP
     uems_serverinfo_name: "serverinfo.json"
 
 
-    # ============================================================
+    # =================================================================
     # WAZUH
-    # ============================================================
+    # =================================================================
 
     wazuh_enabled: true
 
-    wazuh_manager_ip: "192.168.10.54"
+    wazuh_manager_ip: "192.168.10.100"
 
     wazuh_manager_port: 1514
 
@@ -107,31 +89,31 @@
     wazuh_agent_group: "ubuntu-servers"
 
 
-    # ============================================================
+    # =================================================================
     # ZABBIX
-    # ============================================================
+    # =================================================================
 
     zabbix_enabled: true
 
-    zabbix_server_ip: "192.168.10.216"
+    zabbix_server_ip: "192.168.10.101"
 
     zabbix_server_port: 10051
 
     zabbix_version: "7.0"
 
 
-    # ============================================================
+    # =================================================================
     # PATCH MANAGEMENT
-    # ============================================================
+    # =================================================================
 
     patch_management_enabled: true
 
     unattended_security_updates: true
 
 
-    # ============================================================
-    # REQUIRED UBUNTU PACKAGES
-    # ============================================================
+    # =================================================================
+    # REQUIRED SYSTEM PACKAGES
+    # =================================================================
 
     enterprise_packages:
 
@@ -156,26 +138,20 @@
       - python3-apt
       - bash-completion
       - logrotate
-      - rsyslog
-      - chrony
-      - auditd
-      - audispd-plugins
-      - unattended-upgrades
-      - apt-listchanges
 
 
   tasks:
 
-    # ============================================================
+    # =================================================================
     # 1. SERVER INFORMATION
-    # ============================================================
+    # =================================================================
 
     - name: Display server information
       ansible.builtin.debug:
         msg:
-          - "======================================================"
-          - " UBUNTU ENTERPRISE SECURITY DEPLOYMENT"
-          - "======================================================"
+          - "============================================================"
+          - " UBUNTU ENTERPRISE SECURITY STACK"
+          - "============================================================"
           - "Hostname       : {{ ansible_hostname }}"
           - "FQDN           : {{ ansible_fqdn }}"
           - "OS             : {{ ansible_distribution }}"
@@ -185,12 +161,12 @@
           - "Primary IP     : {{ ansible_default_ipv4.address | default('N/A') }}"
           - "CPU Cores      : {{ ansible_processor_vcpus | default('N/A') }}"
           - "RAM            : {{ ansible_memtotal_mb }} MB"
-          - "======================================================"
+          - "============================================================"
 
 
-    # ============================================================
+    # =================================================================
     # 2. OS VALIDATION
-    # ============================================================
+    # =================================================================
 
     - name: Validate operating system
       ansible.builtin.assert:
@@ -199,14 +175,14 @@
           - ansible_distribution_major_version in ["22", "24"]
         fail_msg: >
           Unsupported operating system.
-          This playbook supports Ubuntu 22.04 and Ubuntu 24.04.
+          Supported versions are Ubuntu 22.04 and Ubuntu 24.04.
 
 
-    # ============================================================
-    # 3. DISK SPACE CHECK
-    # ============================================================
+    # =================================================================
+    # 3. DISK SPACE
+    # =================================================================
 
-    - name: Check root filesystem space
+    - name: Check root filesystem free space
       ansible.builtin.shell:
         cmd: |
           df -BG / --output=avail |
@@ -216,19 +192,19 @@
       changed_when: false
 
 
-    - name: Validate available disk space
+    - name: Validate root disk space
       ansible.builtin.assert:
         that:
           - root_disk_free.stdout | int >= minimum_disk_space_gb
         fail_msg: >
           Insufficient disk space.
-          Minimum required: {{ minimum_disk_space_gb }} GB.
+          Required: {{ minimum_disk_space_gb }} GB.
           Available: {{ root_disk_free.stdout }} GB.
 
 
-    # ============================================================
-    # 4. UPDATE APT CACHE
-    # ============================================================
+    # =================================================================
+    # 4. APT CACHE
+    # =================================================================
 
     - name: Update APT cache
       ansible.builtin.apt:
@@ -236,33 +212,40 @@
         cache_valid_time: 3600
 
 
-    # ============================================================
-    # 5. FULL INSTALLED SOFTWARE INVENTORY
-    # ============================================================
+    # =================================================================
+    # 5. BASE PACKAGE DETECTION
+    # =================================================================
 
-    - name: Collect installed Debian packages
-      ansible.builtin.shell:
-        cmd: |
-          dpkg-query -W \
-            -f='${Package}|${Version}|${Status}\n' \
-            2>/dev/null
-      register: installed_packages
-      changed_when: false
+    - name: Detect base enterprise packages
+      ansible.builtin.package_facts:
+        manager: auto
 
 
-    - name: Count installed packages
-      ansible.builtin.set_fact:
-        installed_package_count: "{{ installed_packages.stdout_lines | length }}"
+    # =================================================================
+    # 6. UEMS DETECTION
+    # =================================================================
 
-
-    # ============================================================
-    # 6. DETECT UEMS
-    # ============================================================
-
-    - name: Check UEMS installation directory
+    - name: Check UEMS installation path
       ansible.builtin.stat:
         path: "{{ uems_install_dir }}"
       register: uems_install_dir_check
+      when: uems_enabled
+
+
+    - name: Determine whether UEMS directory exists
+      ansible.builtin.set_fact:
+        uems_path_exists: >-
+          {{
+            uems_install_dir_check.stat.exists
+            | default(false)
+          }}
+
+        uems_path_is_directory: >-
+          {{
+            uems_install_dir_check.stat.exists
+            and
+            uems_install_dir_check.stat.isdir | default(false)
+          }}
       when: uems_enabled
 
 
@@ -277,16 +260,19 @@
         recurse: true
         file_type: file
       register: uems_agent_files
+      changed_when: false
       failed_when: false
-      when: uems_enabled
+      when:
+        - uems_enabled
+        - uems_path_is_directory | default(false)
 
 
     - name: Detect UEMS processes
       ansible.builtin.shell:
         cmd: |
           pgrep -af \
-            'desktopcentral|uems|dcagent|dcaagent' || true
-      register: uems_process_check
+          'desktopcentral|uems|dcagent|dcaagent' || true
+      register: uems_process_detection
       changed_when: false
       failed_when: false
       when: uems_enabled
@@ -296,10 +282,10 @@
       ansible.builtin.shell:
         cmd: |
           systemctl list-unit-files \
-            --type=service \
-            --no-legend 2>/dev/null |
+          --type=service \
+          --no-legend 2>/dev/null |
           grep -Ei \
-            'desktopcentral|uems|dcagent|dcaagent' |
+          'desktopcentral|uems|dcagent|dcaagent' |
           awk '{print $1}' |
           head -10 || true
       register: uems_service_detection
@@ -308,117 +294,243 @@
       when: uems_enabled
 
 
-    - name: Set UEMS installation status
+    - name: Determine UEMS installation status
       ansible.builtin.set_fact:
+
+        uems_agent_file_count: >-
+          {{
+            uems_agent_files.matched
+            | default(0)
+            | int
+          }}
+
         uems_installed: >-
           {{
             (
-              uems_install_dir_check.stat.exists
+              uems_path_is_directory | default(false)
               and
-              uems_agent_files.matched | int > 0
+              (uems_agent_files.matched | default(0) | int > 0)
             )
             or
             (
-              uems_process_check.stdout | trim != ""
+              uems_process_detection.stdout
+              | default('')
+              | trim
+              != ''
             )
             or
             (
-              uems_service_detection.stdout | trim != ""
+              uems_service_detection.stdout
+              | default('')
+              | trim
+              != ''
             )
           }}
       when: uems_enabled
 
 
-    - name: Display UEMS detection result
+    - name: Set UEMS disabled state
+      ansible.builtin.set_fact:
+        uems_installed: false
+        uems_agent_file_count: 0
+      when: not uems_enabled
+
+
+    - name: Display UEMS detection
       ansible.builtin.debug:
         msg:
-          - "UEMS enabled       : {{ uems_enabled }}"
-          - "UEMS installed     : {{ uems_installed | default(false) }}"
-          - "Installation path  : {{ uems_install_dir }}"
-          - "Agent files found  : {{ uems_agent_files.matched | default(0) }}"
-          - "Services detected  : {{ uems_service_detection.stdout | default('NONE') }}"
-      when: uems_enabled
+          - "UEMS enabled          : {{ uems_enabled }}"
+          - "UEMS installed        : {{ uems_installed }}"
+          - "Installation path     : {{ uems_install_dir }}"
+          - "Path is directory     : {{ uems_path_is_directory | default(false) }}"
+          - "Agent files detected  : {{ uems_agent_file_count }}"
+          - "Services detected     : {{ uems_service_detection.stdout | default('NONE') | trim }}"
 
 
-    # ============================================================
-    # 7. DETECT WAZUH
-    # ============================================================
+    # =================================================================
+    # 7. WAZUH DETECTION
+    # =================================================================
 
-    - name: Detect Wazuh Agent
-      ansible.builtin.shell:
-        cmd: |
-          dpkg-query -W \
-            -f='${Status}' \
-            wazuh-agent 2>/dev/null
-      register: wazuh_detect
-      changed_when: false
-      failed_when: false
-      when: wazuh_enabled
-
-
-    - name: Set Wazuh installation status
+    - name: Detect Wazuh Agent package
       ansible.builtin.set_fact:
         wazuh_installed: >-
           {{
-            wazuh_detect.rc == 0
-            and
-            'install ok installed' in wazuh_detect.stdout
+            'wazuh-agent' in ansible_facts.packages
           }}
       when: wazuh_enabled
+
+
+    - name: Set Wazuh disabled state
+      ansible.builtin.set_fact:
+        wazuh_installed: false
+      when: not wazuh_enabled
+
+
+    - name: Get installed Wazuh version
+      ansible.builtin.set_fact:
+        wazuh_installed_version: >-
+          {{
+            ansible_facts.packages['wazuh-agent'][0].version
+            if 'wazuh-agent' in ansible_facts.packages
+            else 'NOT_INSTALLED'
+          }}
 
 
     - name: Display Wazuh detection
       ansible.builtin.debug:
-        msg: "Wazuh installed: {{ wazuh_installed | default(false) }}"
-      when: wazuh_enabled
+        msg:
+          - "Wazuh enabled     : {{ wazuh_enabled }}"
+          - "Wazuh installed   : {{ wazuh_installed }}"
+          - "Wazuh version     : {{ wazuh_installed_version }}"
 
 
-    # ============================================================
-    # 8. DETECT ZABBIX
-    # ============================================================
+    # =================================================================
+    # 8. ZABBIX DETECTION
+    # =================================================================
+
+    - name: Detect Zabbix Agent
+      ansible.builtin.set_fact:
+        zabbix_agent_installed: >-
+          {{
+            'zabbix-agent' in ansible_facts.packages
+          }}
+
 
     - name: Detect Zabbix Agent 2
-      ansible.builtin.shell:
-        cmd: |
-          dpkg-query -W \
-            -f='${Status}' \
-            zabbix-agent2 2>/dev/null
-      register: zabbix_detect
-      changed_when: false
-      failed_when: false
-      when: zabbix_enabled
+      ansible.builtin.set_fact:
+        zabbix_agent2_installed: >-
+          {{
+            'zabbix-agent2' in ansible_facts.packages
+          }}
 
 
-    - name: Set Zabbix installation status
+    - name: Determine whether any Zabbix agent exists
       ansible.builtin.set_fact:
         zabbix_installed: >-
           {{
-            zabbix_detect.rc == 0
-            and
-            'install ok installed' in zabbix_detect.stdout
+            zabbix_agent_installed
+            or
+            zabbix_agent2_installed
           }}
-      when: zabbix_enabled
+
+
+    - name: Get Zabbix Agent version
+      ansible.builtin.set_fact:
+        zabbix_agent_version: >-
+          {{
+            ansible_facts.packages['zabbix-agent'][0].version
+            if 'zabbix-agent' in ansible_facts.packages
+            else 'NOT_INSTALLED'
+          }}
+
+
+    - name: Get Zabbix Agent 2 version
+      ansible.builtin.set_fact:
+        zabbix_agent2_version: >-
+          {{
+            ansible_facts.packages['zabbix-agent2'][0].version
+            if 'zabbix-agent2' in ansible_facts.packages
+            else 'NOT_INSTALLED'
+          }}
 
 
     - name: Display Zabbix detection
       ansible.builtin.debug:
-        msg: "Zabbix installed: {{ zabbix_installed | default(false) }}"
-      when: zabbix_enabled
+        msg:
+          - "Zabbix Agent installed : {{ zabbix_agent_installed }}"
+          - "Zabbix Agent version   : {{ zabbix_agent_version }}"
+          - "Zabbix Agent 2 installed: {{ zabbix_agent2_installed }}"
+          - "Zabbix Agent 2 version  : {{ zabbix_agent2_version }}"
 
 
-    # ============================================================
-    # 9. INSTALL REQUIRED PACKAGES
-    # ============================================================
+    # =================================================================
+    # 9. DETECT SYSTEM SERVICES
+    # =================================================================
 
-    - name: Install required enterprise packages
+    - name: Detect Auditd
+      ansible.builtin.set_fact:
+        auditd_installed: "{{ 'auditd' in ansible_facts.packages }}"
+
+
+    - name: Detect Chrony
+      ansible.builtin.set_fact:
+        chrony_installed: "{{ 'chrony' in ansible_facts.packages }}"
+
+
+    - name: Detect Rsyslog
+      ansible.builtin.set_fact:
+        rsyslog_installed: "{{ 'rsyslog' in ansible_facts.packages }}"
+
+
+    # =================================================================
+    # 10. INSTALL BASE PACKAGES ONLY IF MISSING
+    # =================================================================
+
+    - name: Install base enterprise packages
       ansible.builtin.apt:
         name: "{{ enterprise_packages }}"
         state: present
 
 
-    # ============================================================
-    # 10. UEMS DOWNLOAD DIRECTORY
-    # ============================================================
+    # =================================================================
+    # 11. INSTALL AUDITD IF MISSING
+    # =================================================================
+
+    - name: Install Auditd
+      ansible.builtin.apt:
+        name:
+          - auditd
+          - audispd-plugins
+        state: present
+      when: not auditd_installed
+
+
+    - name: Enable Auditd
+      ansible.builtin.systemd:
+        name: auditd
+        enabled: true
+        state: started
+
+
+    # =================================================================
+    # 12. INSTALL CHRONY IF MISSING
+    # =================================================================
+
+    - name: Install Chrony
+      ansible.builtin.apt:
+        name: chrony
+        state: present
+      when: not chrony_installed
+
+
+    - name: Enable Chrony
+      ansible.builtin.systemd:
+        name: chrony
+        enabled: true
+        state: started
+
+
+    # =================================================================
+    # 13. INSTALL RSYSLOG IF MISSING
+    # =================================================================
+
+    - name: Install Rsyslog
+      ansible.builtin.apt:
+        name: rsyslog
+        state: present
+      when: not rsyslog_installed
+
+
+    - name: Enable Rsyslog
+      ansible.builtin.systemd:
+        name: rsyslog
+        enabled: true
+        state: started
+
+
+    # =================================================================
+    # 14. UEMS DOWNLOAD DIRECTORY
+    # =================================================================
 
     - name: Create UEMS installer directory
       ansible.builtin.file:
@@ -432,11 +544,11 @@
         - not uems_installed
 
 
-    # ============================================================
-    # 11. DOWNLOAD UEMS
-    # ============================================================
+    # =================================================================
+    # 15. UEMS DOWNLOAD
+    # =================================================================
 
-    - name: Download UEMS Linux Agent package
+    - name: Download UEMS package
       ansible.builtin.get_url:
         url: "{{ uems_download_url }}"
         dest: "{{ uems_download_dir }}/{{ uems_archive_name }}"
@@ -449,11 +561,11 @@
         - not uems_installed
 
 
-    # ============================================================
-    # 12. EXTRACT UEMS
-    # ============================================================
+    # =================================================================
+    # 16. UEMS EXTRACT
+    # =================================================================
 
-    - name: Extract UEMS Linux Agent package
+    - name: Extract UEMS package
       ansible.builtin.unarchive:
         src: "{{ uems_download_dir }}/{{ uems_archive_name }}"
         dest: "{{ uems_download_dir }}"
@@ -463,11 +575,11 @@
         - not uems_installed
 
 
-    # ============================================================
-    # 13. VERIFY UEMS_LinuxAgent.bin
-    # ============================================================
+    # =================================================================
+    # 17. VERIFY UEMS INSTALLER
+    # =================================================================
 
-    - name: Check UEMS installer
+    - name: Check UEMS binary
       ansible.builtin.stat:
         path: "{{ uems_download_dir }}/{{ uems_installer_name }}"
       register: uems_bin_check
@@ -475,10 +587,6 @@
         - uems_enabled
         - not uems_installed
 
-
-    # ============================================================
-    # 14. VERIFY serverinfo.json
-    # ============================================================
 
     - name: Check UEMS serverinfo.json
       ansible.builtin.stat:
@@ -489,32 +597,28 @@
         - not uems_installed
 
 
-    # ============================================================
-    # 15. VALIDATE UEMS INSTALLATION FILES
-    # ============================================================
-
-    - name: Validate UEMS installation files
+    - name: Validate UEMS files
       ansible.builtin.assert:
         that:
           - uems_bin_check.stat.exists
           - uems_serverinfo_check.stat.exists
         fail_msg: |
-          UEMS installation cannot continue.
+          UEMS installation files are incomplete.
 
-          Required files:
+          Expected:
 
           {{ uems_download_dir }}/{{ uems_installer_name }}
           {{ uems_download_dir }}/{{ uems_serverinfo_name }}
 
-          Both files must exist in the same directory.
+          Both files are required.
       when:
         - uems_enabled
         - not uems_installed
 
 
-    # ============================================================
-    # 16. MAKE UEMS INSTALLER EXECUTABLE
-    # ============================================================
+    # =================================================================
+    # 18. INSTALL UEMS
+    # =================================================================
 
     - name: Make UEMS installer executable
       ansible.builtin.file:
@@ -527,54 +631,57 @@
         - not uems_installed
 
 
-    # ============================================================
-    # 17. INSTALL UEMS
-    # ============================================================
-
     - name: Install UEMS Linux Agent
       ansible.builtin.command:
         cmd: "./{{ uems_installer_name }}"
         chdir: "{{ uems_download_dir }}"
       register: uems_install_result
+      changed_when: true
+      failed_when: false
       when:
         - uems_enabled
         - not uems_installed
 
 
-    # ============================================================
-    # 18. VERIFY UEMS INSTALLATION
-    # ============================================================
+    # =================================================================
+    # 19. RE-DETECT UEMS AFTER INSTALL
+    # =================================================================
 
-    - name: Verify UEMS installation directory
+    - name: Re-check UEMS installation directory
       ansible.builtin.stat:
         path: "{{ uems_install_dir }}"
-      register: uems_post_install
-      when: uems_enabled
+      register: uems_post_install_path
 
 
-    - name: Check UEMS processes after installation
-      ansible.builtin.shell:
-        cmd: |
-          pgrep -af \
-            'desktopcentral|uems|dcagent|dcaagent' || true
-      register: uems_process_after_install
-      changed_when: false
+    - name: Check UEMS files after installation
+      ansible.builtin.find:
+        paths:
+          - "{{ uems_install_dir }}"
+        patterns:
+          - "dcaagent"
+          - "dcagent"
+          - "dctroubleshootingtool"
+        recurse: true
+        file_type: file
+      register: uems_post_install_files
       failed_when: false
-      when: uems_enabled
+      when:
+        - uems_post_install_path.stat.exists
+        - uems_post_install_path.stat.isdir | default(false)
 
 
-    # ============================================================
-    # 19. DETECT UEMS SERVICE AFTER INSTALL
-    # ============================================================
+    # =================================================================
+    # 20. UEMS SERVICE DETECTION
+    # =================================================================
 
     - name: Detect UEMS service after installation
       ansible.builtin.shell:
         cmd: |
           systemctl list-unit-files \
-            --type=service \
-            --no-legend 2>/dev/null |
+          --type=service \
+          --no-legend 2>/dev/null |
           grep -Ei \
-            'desktopcentral|uems|dcagent|dcaagent' |
+          'desktopcentral|uems|dcagent|dcaagent' |
           awk '{print $1}' |
           head -1 || true
       register: uems_service_after_install
@@ -588,27 +695,59 @@
         uems_service_name: "{{ uems_service_after_install.stdout | trim }}"
       when:
         - uems_enabled
-        - uems_service_after_install.stdout | trim != ""
+        - uems_service_after_install.stdout | default('') | trim != ""
 
 
-    # ============================================================
-    # 20. START UEMS SERVICE
-    # ============================================================
+    # =================================================================
+    # 21. START UEMS SERVICE
+    # =================================================================
 
     - name: Enable and start UEMS service
       ansible.builtin.systemd:
         name: "{{ uems_service_name }}"
         enabled: true
         state: started
+      register: uems_service_start
+      failed_when: false
       when:
         - uems_enabled
         - uems_service_name is defined
         - uems_service_name | length > 0
 
 
-    # ============================================================
-    # 21. UEMS VERSION
-    # ============================================================
+    # =================================================================
+    # 22. UEMS PROCESS VERIFICATION
+    # =================================================================
+
+    - name: Check UEMS processes
+      ansible.builtin.shell:
+        cmd: |
+          pgrep -af \
+          'desktopcentral|uems|dcagent|dcaagent' || true
+      register: uems_process_after_install
+      changed_when: false
+      failed_when: false
+      when: uems_enabled
+
+
+    # =================================================================
+    # 23. UEMS VERSION VERIFICATION
+    # =================================================================
+
+    - name: Initialize UEMS version
+      ansible.builtin.set_fact:
+        uems_version: "UNKNOWN"
+
+
+    - name: Check UEMS troubleshooting tool
+      ansible.builtin.stat:
+        path: "{{ uems_install_dir }}/bin/dctroubleshootingtool"
+      register: uems_troubleshooting_tool
+      when:
+        - uems_enabled
+        - uems_post_install_path.stat.exists
+        - uems_post_install_path.stat.isdir | default(false)
+
 
     - name: Run UEMS troubleshooting tool
       ansible.builtin.command:
@@ -618,29 +757,29 @@
       failed_when: false
       when:
         - uems_enabled
-        - uems_post_install.stat.exists
-        - uems_install_dir is defined
+        - uems_troubleshooting_tool.stat.exists | default(false)
 
 
-    - name: Extract UEMS agent version
+    - name: Extract UEMS version safely
       ansible.builtin.set_fact:
         uems_version: >-
           {{
             (
               uems_troubleshooting.stdout
+              | default('')
               | regex_findall('AGENT VERSION\\s+([^\\s]+)')
               | first
             )
-            | default('UNKNOWN')
+            | default('UNKNOWN', true)
           }}
       when:
         - uems_enabled
         - uems_troubleshooting is defined
 
 
-    # ============================================================
-    # 22. WAZUH REPOSITORY
-    # ============================================================
+    # =================================================================
+    # 24. WAZUH REPOSITORY
+    # =================================================================
 
     - name: Install Wazuh GPG key
       ansible.builtin.get_url:
@@ -672,9 +811,9 @@
         - not wazuh_installed
 
 
-    # ============================================================
-    # 23. INSTALL WAZUH
-    # ============================================================
+    # =================================================================
+    # 25. INSTALL WAZUH IF MISSING
+    # =================================================================
 
     - name: Install Wazuh Agent
       ansible.builtin.apt:
@@ -691,9 +830,9 @@
         - not wazuh_installed
 
 
-    # ============================================================
-    # 24. CONFIGURE WAZUH
-    # ============================================================
+    # =================================================================
+    # 26. CONFIGURE WAZUH
+    # =================================================================
 
     - name: Configure Wazuh manager
       ansible.builtin.replace:
@@ -702,43 +841,41 @@
         replace: "<address>{{ wazuh_manager_ip }}</address>"
       when:
         - wazuh_enabled
+        - wazuh_installed
       notify: Restart Wazuh
 
 
-    # ============================================================
-    # 25. START WAZUH
-    # ============================================================
-
-    - name: Enable and start Wazuh
+    - name: Enable Wazuh
       ansible.builtin.systemd:
         name: wazuh-agent
         enabled: true
         state: started
-      when: wazuh_enabled
-
-
-    # ============================================================
-    # 26. WAZUH VERSION
-    # ============================================================
-
-    - name: Get Wazuh version
-      ansible.builtin.shell:
-        cmd: |
-          dpkg-query -W \
-            -f='${Version}' \
-            wazuh-agent 2>/dev/null ||
-          echo "NOT_INSTALLED"
-      register: wazuh_version_result
-      changed_when: false
+      register: wazuh_service_start
       failed_when: false
       when: wazuh_enabled
 
 
-    # ============================================================
-    # 27. ZABBIX REPOSITORY
-    # ============================================================
+    # =================================================================
+    # 27. WAZUH VERSION
+    # =================================================================
 
-    - name: Download Zabbix repository package
+    - name: Get final Wazuh version
+      ansible.builtin.shell:
+        cmd: |
+          dpkg-query -W \
+          -f='${Version}' \
+          wazuh-agent 2>/dev/null ||
+          echo "NOT_INSTALLED"
+      register: wazuh_final_version
+      changed_when: false
+      failed_when: false
+
+
+    # =================================================================
+    # 28. ZABBIX INSTALLATION
+    # =================================================================
+
+    - name: Install Zabbix repository package
       ansible.builtin.get_url:
         url: "https://repo.zabbix.com/zabbix/{{ zabbix_version }}/release/ubuntu/pool/main/z/zabbix-release/zabbix-release_latest_{{ zabbix_version }}+ubuntu{{ ansible_distribution_version | replace('.', '') }}_all.deb"
         dest: "/tmp/zabbix-release.deb"
@@ -764,10 +901,6 @@
         - not zabbix_installed
 
 
-    # ============================================================
-    # 28. INSTALL ZABBIX AGENT 2
-    # ============================================================
-
     - name: Install Zabbix Agent 2
       ansible.builtin.apt:
         name: zabbix-agent2
@@ -777,16 +910,19 @@
         - not zabbix_installed
 
 
-    # ============================================================
-    # 29. CONFIGURE ZABBIX
-    # ============================================================
+    # =================================================================
+    # 29. ZABBIX CONFIGURATION
+    # =================================================================
 
     - name: Configure Zabbix Server
       ansible.builtin.lineinfile:
         path: /etc/zabbix/zabbix_agent2.conf
         regexp: '^#?\s*Server='
         line: "Server={{ zabbix_server_ip }}"
-      when: zabbix_enabled
+      when:
+        - zabbix_enabled
+        - zabbix_agent2_installed | default(false)
+        or not zabbix_installed
       notify: Restart Zabbix
 
 
@@ -795,7 +931,10 @@
         path: /etc/zabbix/zabbix_agent2.conf
         regexp: '^#?\s*ServerActive='
         line: "ServerActive={{ zabbix_server_ip }}:{{ zabbix_server_port }}"
-      when: zabbix_enabled
+      when:
+        - zabbix_enabled
+        - zabbix_agent2_installed | default(false)
+        or not zabbix_installed
       notify: Restart Zabbix
 
 
@@ -804,85 +943,76 @@
         path: /etc/zabbix/zabbix_agent2.conf
         regexp: '^#?\s*Hostname='
         line: "Hostname={{ ansible_hostname }}"
-      when: zabbix_enabled
+      when:
+        - zabbix_enabled
+        - zabbix_agent2_installed | default(false)
+        or not zabbix_installed
       notify: Restart Zabbix
 
 
-    # ============================================================
-    # 30. START ZABBIX
-    # ============================================================
+    # =================================================================
+    # 30. START EXISTING ZABBIX AGENT
+    # =================================================================
 
-    - name: Enable and start Zabbix Agent 2
+    - name: Enable existing Zabbix Agent
+      ansible.builtin.systemd:
+        name: zabbix-agent
+        enabled: true
+        state: started
+      register: zabbix_agent_service
+      failed_when: false
+      when:
+        - zabbix_enabled
+        - zabbix_agent_installed
+
+
+    # =================================================================
+    # 31. START ZABBIX AGENT 2
+    # =================================================================
+
+    - name: Enable Zabbix Agent 2
       ansible.builtin.systemd:
         name: zabbix-agent2
         enabled: true
         state: started
-      when: zabbix_enabled
+      register: zabbix_agent2_service
+      failed_when: false
+      when:
+        - zabbix_enabled
+        - zabbix_agent2_installed or not zabbix_installed
 
 
-    # ============================================================
-    # 31. ZABBIX VERSION
-    # ============================================================
+    # =================================================================
+    # 32. FINAL ZABBIX VERSION
+    # =================================================================
 
-    - name: Get Zabbix version
+    - name: Get final Zabbix Agent version
       ansible.builtin.shell:
         cmd: |
           dpkg-query -W \
-            -f='${Version}' \
-            zabbix-agent2 2>/dev/null ||
+          -f='${Version}' \
+          zabbix-agent 2>/dev/null ||
           echo "NOT_INSTALLED"
-      register: zabbix_version_result
+      register: zabbix_final_agent_version
       changed_when: false
       failed_when: false
-      when: zabbix_enabled
 
 
-    # ============================================================
-    # 32. SYSTEM SERVICES
-    # ============================================================
-
-    - name: Ensure Chrony installed
-      ansible.builtin.apt:
-        name: chrony
-        state: present
-
-
-    - name: Enable Chrony
-      ansible.builtin.systemd:
-        name: chrony
-        enabled: true
-        state: started
+    - name: Get final Zabbix Agent 2 version
+      ansible.builtin.shell:
+        cmd: |
+          dpkg-query -W \
+          -f='${Version}' \
+          zabbix-agent2 2>/dev/null ||
+          echo "NOT_INSTALLED"
+      register: zabbix_final_agent2_version
+      changed_when: false
+      failed_when: false
 
 
-    - name: Ensure Rsyslog installed
-      ansible.builtin.apt:
-        name: rsyslog
-        state: present
-
-
-    - name: Enable Rsyslog
-      ansible.builtin.systemd:
-        name: rsyslog
-        enabled: true
-        state: started
-
-
-    - name: Ensure Auditd installed
-      ansible.builtin.apt:
-        name: auditd
-        state: present
-
-
-    - name: Enable Auditd
-      ansible.builtin.systemd:
-        name: auditd
-        enabled: true
-        state: started
-
-
-    # ============================================================
+    # =================================================================
     # 33. PATCH MANAGEMENT
-    # ============================================================
+    # =================================================================
 
     - name: Configure automatic updates
       ansible.builtin.copy:
@@ -900,7 +1030,7 @@
         - unattended_security_updates
 
 
-    - name: Configure security unattended upgrades
+    - name: Configure unattended security upgrades
       ansible.builtin.copy:
         dest: /etc/apt/apt.conf.d/52unattended-upgrades
         owner: root
@@ -919,9 +1049,9 @@
         - unattended_security_updates
 
 
-    # ============================================================
-    # 34. PENDING UPDATES
-    # ============================================================
+    # =================================================================
+    # 34. PATCH STATUS
+    # =================================================================
 
     - name: Refresh package lists
       ansible.builtin.apt:
@@ -937,10 +1067,11 @@
           wc -l
       register: pending_updates
       changed_when: false
+      failed_when: false
       when: patch_management_enabled
 
 
-    - name: Get pending security updates
+    - name: Count pending security updates
       ansible.builtin.shell:
         cmd: |
           apt list --upgradable 2>/dev/null |
@@ -952,11 +1083,11 @@
       when: patch_management_enabled
 
 
-    # ============================================================
-    # 35. OPTIONAL OS UPGRADE
-    # ============================================================
+    # =================================================================
+    # 35. OPTIONAL FULL PACKAGE UPGRADE
+    # =================================================================
 
-    - name: Perform OS package upgrade
+    - name: Perform full package upgrade
       ansible.builtin.apt:
         upgrade: dist
         autoremove: true
@@ -966,19 +1097,19 @@
         - perform_os_upgrade
 
 
-    # ============================================================
-    # 36. REBOOT DETECTION
-    # ============================================================
+    # =================================================================
+    # 36. REBOOT REQUIRED
+    # =================================================================
 
-    - name: Check whether reboot is required
+    - name: Check reboot requirement
       ansible.builtin.stat:
         path: /var/run/reboot-required
       register: reboot_required
 
 
-    - name: Reboot server when enabled
+    - name: Reboot server if configured
       ansible.builtin.reboot:
-        msg: "Ubuntu Enterprise Security Stack requires system reboot."
+        msg: "Ubuntu Enterprise Security Stack requested reboot."
         reboot_timeout: 900
         connect_timeout: 30
         test_command: "uptime"
@@ -987,122 +1118,124 @@
         - auto_reboot
 
 
-    # ============================================================
-    # 37. FINAL SERVICE STATUS
-    # ============================================================
+    # =================================================================
+    # 37. SERVICE STATUS
+    # =================================================================
 
-    - name: Get UEMS service status
+    - name: Check Auditd service
       ansible.builtin.command:
-        cmd: "systemctl is-active {{ uems_service_name }}"
-      register: uems_service_status
+        cmd: systemctl is-active auditd
+      register: auditd_service_status
       changed_when: false
       failed_when: false
-      when:
-        - uems_enabled
-        - uems_service_name is defined
-        - uems_service_name | length > 0
 
 
-    - name: Get Wazuh service status
+    - name: Check Chrony service
       ansible.builtin.command:
-        cmd: "systemctl is-active wazuh-agent"
+        cmd: systemctl is-active chrony
+      register: chrony_service_status
+      changed_when: false
+      failed_when: false
+
+
+    - name: Check Rsyslog service
+      ansible.builtin.command:
+        cmd: systemctl is-active rsyslog
+      register: rsyslog_service_status
+      changed_when: false
+      failed_when: false
+
+
+    - name: Check Wazuh service
+      ansible.builtin.command:
+        cmd: systemctl is-active wazuh-agent
       register: wazuh_service_status
       changed_when: false
       failed_when: false
       when: wazuh_enabled
 
 
-    - name: Get Zabbix service status
+    - name: Check Zabbix Agent service
       ansible.builtin.command:
-        cmd: "systemctl is-active zabbix-agent2"
-      register: zabbix_service_status
+        cmd: systemctl is-active zabbix-agent
+      register: zabbix_agent_service_status
       changed_when: false
       failed_when: false
-      when: zabbix_enabled
+      when:
+        - zabbix_enabled
+        - zabbix_agent_installed
 
 
-    - name: Get Chrony service status
+    - name: Check Zabbix Agent 2 service
       ansible.builtin.command:
-        cmd: "systemctl is-active chrony"
-      register: chrony_service_status
+        cmd: systemctl is-active zabbix-agent2
+      register: zabbix_agent2_service_status
       changed_when: false
       failed_when: false
+      when:
+        - zabbix_enabled
+        - zabbix_agent2_installed or not zabbix_installed
 
 
-    - name: Get Rsyslog service status
-      ansible.builtin.command:
-        cmd: "systemctl is-active rsyslog"
-      register: rsyslog_service_status
-      changed_when: false
-      failed_when: false
-
-
-    - name: Get Auditd service status
-      ansible.builtin.command:
-        cmd: "systemctl is-active auditd"
-      register: auditd_service_status
-      changed_when: false
-      failed_when: false
-
-
-    # ============================================================
+    # =================================================================
     # 38. VERSION VERIFICATION
-    # ============================================================
+    # =================================================================
 
     - name: Get Auditd version
       ansible.builtin.shell:
         cmd: |
           dpkg-query -W \
-            -f='${Version}' \
-            auditd 2>/dev/null ||
+          -f='${Version}' auditd 2>/dev/null ||
           echo "NOT_INSTALLED"
-      register: auditd_version_result
+      register: auditd_version
       changed_when: false
+      failed_when: false
 
 
     - name: Get Chrony version
       ansible.builtin.shell:
         cmd: |
           dpkg-query -W \
-            -f='${Version}' \
-            chrony 2>/dev/null ||
+          -f='${Version}' chrony 2>/dev/null ||
           echo "NOT_INSTALLED"
-      register: chrony_version_result
+      register: chrony_version
       changed_when: false
+      failed_when: false
 
 
     - name: Get Rsyslog version
       ansible.builtin.shell:
         cmd: |
           dpkg-query -W \
-            -f='${Version}' \
-            rsyslog 2>/dev/null ||
+          -f='${Version}' rsyslog 2>/dev/null ||
           echo "NOT_INSTALLED"
-      register: rsyslog_version_result
+      register: rsyslog_version
       changed_when: false
+      failed_when: false
 
 
-    # ============================================================
+    # =================================================================
     # 39. FAILED SYSTEMD SERVICES
-    # ============================================================
+    # =================================================================
 
-    - name: Detect failed systemd services
+    - name: Detect failed services
       ansible.builtin.shell:
         cmd: |
           systemctl --failed \
-            --no-legend \
-            --no-pager 2>/dev/null |
+          --no-legend \
+          --no-pager 2>/dev/null |
           awk '{print $2}' |
           sed '/^$/d' || true
       register: failed_services
       changed_when: false
+      failed_when: false
 
 
-    # ============================================================
-    # 40. CPU / MEMORY / DISK HEALTH
-    # ============================================================
+    # =================================================================
+    # 40. SYSTEM HEALTH
+    # =================================================================
 
-    - name: Get memory utilization
+    - name: Get memory usage
       ansible.builtin.shell:
         cmd: |
           free -m |
@@ -1113,7 +1246,7 @@
       changed_when: false
 
 
-    - name: Get disk utilization
+    - name: Get disk usage
       ansible.builtin.shell:
         cmd: |
           df -P / |
@@ -1133,115 +1266,182 @@
       changed_when: false
 
 
-    # ============================================================
-    # 41. SOFTWARE INVENTORY
-    # ============================================================
+    # =================================================================
+    # 41. COMPLETE SOFTWARE INVENTORY
+    # =================================================================
 
-    - name: Generate security software inventory
+    - name: Generate complete installed software inventory
       ansible.builtin.shell:
         cmd: |
           dpkg-query -W \
-            -f='${Package}|${Version}\n' 2>/dev/null |
-          grep -Ei \
-            'wazuh|zabbix|seqrite|quickheal|manageengine|desktopcentral|uems|auditd|chrony|rsyslog|unattended' \
-            || true
-      register: security_software_inventory
-      changed_when: false
-
-
-    - name: Generate complete installed package inventory
-      ansible.builtin.shell:
-        cmd: |
-          dpkg-query -W \
-            -f='${Package}|${Version}|${Status}\n' \
-            2>/dev/null |
+          -f='${Package}|${Version}|${Status}\n' \
+          2>/dev/null |
           sort
       register: complete_software_inventory
       changed_when: false
 
 
-    # ============================================================
-    # 42. HEALTH CALCULATION
-    # ============================================================
+    - name: Generate security software inventory
+      ansible.builtin.shell:
+        cmd: |
+          dpkg-query -W \
+          -f='${Package}|${Version}|${Status}\n' \
+          2>/dev/null |
+          grep -Ei \
+          'wazuh|zabbix|seqrite|quickheal|manageengine|desktopcentral|uems|auditd|chrony|rsyslog|unattended' \
+          || true
+      register: security_software_inventory
+      changed_when: false
+
+
+    - name: Count installed packages
+      ansible.builtin.set_fact:
+        installed_package_count: >-
+          {{
+            complete_software_inventory.stdout_lines
+            | length
+          }}
+
+
+    # =================================================================
+    # 42. HEALTH CALCULATION - UEMS
+    # =================================================================
 
     - name: Calculate UEMS health
       ansible.builtin.set_fact:
         uems_health: >-
           {{
-            'HEALTHY'
-            if
+            'NOT_ENABLED'
+            if not uems_enabled
+            else
             (
-              not uems_enabled
-              or
+              'HEALTHY'
+              if
               (
-                uems_post_install.stat.exists
-                and
                 (
                   uems_service_status.rc == 0
                   if uems_service_name is defined
                   else
-                  uems_process_after_install.stdout | trim != ""
+                  (
+                    uems_process_after_install.stdout
+                    | default('')
+                    | trim
+                    != ''
+                  )
+                )
+                and
+                (
+                  uems_version != 'UNKNOWN'
+                  or
+                  uems_path_exists | default(false)
                 )
               )
+              else
+              (
+                'INSTALLED_BUT_SERVICE_NOT_DETECTED'
+                if uems_installed
+                else
+                'NOT_INSTALLED'
+              )
             )
-            else 'FAILED'
           }}
 
+
+    # =================================================================
+    # 43. HEALTH CALCULATION - WAZUH
+    # =================================================================
 
     - name: Calculate Wazuh health
       ansible.builtin.set_fact:
         wazuh_health: >-
           {{
-            'HEALTHY'
-            if
+            'NOT_ENABLED'
+            if not wazuh_enabled
+            else
             (
-              not wazuh_enabled
-              or
+              'HEALTHY'
+              if
               (
                 wazuh_service_status.rc == 0
                 and
-                wazuh_version_result.stdout != 'NOT_INSTALLED'
+                wazuh_final_version.stdout
+                | default('NOT_INSTALLED')
+                != 'NOT_INSTALLED'
+              )
+              else
+              (
+                'INSTALLED_BUT_SERVICE_NOT_RUNNING'
+                if wazuh_installed
+                else
+                'NOT_INSTALLED'
               )
             )
-            else 'FAILED'
           }}
 
+
+    # =================================================================
+    # 44. HEALTH CALCULATION - ZABBIX
+    # =================================================================
 
     - name: Calculate Zabbix health
       ansible.builtin.set_fact:
         zabbix_health: >-
           {{
-            'HEALTHY'
-            if
+            'NOT_ENABLED'
+            if not zabbix_enabled
+            else
             (
-              not zabbix_enabled
-              or
+              'HEALTHY'
+              if
               (
-                zabbix_service_status.rc == 0
-                and
-                zabbix_version_result.stdout != 'NOT_INSTALLED'
+                (
+                  zabbix_agent_installed
+                  and
+                  zabbix_agent_service_status.rc == 0
+                )
+                or
+                (
+                  zabbix_agent2_installed
+                  and
+                  zabbix_agent2_service_status.rc == 0
+                )
+              )
+              else
+              (
+                'INSTALLED_BUT_SERVICE_NOT_RUNNING'
+                if zabbix_installed
+                else
+                'NOT_INSTALLED'
               )
             )
-            else 'FAILED'
           }}
 
 
-    - name: Calculate system services health
+    # =================================================================
+    # 45. SYSTEM SERVICE HEALTH
+    # =================================================================
+
+    - name: Calculate system service health
       ansible.builtin.set_fact:
         system_services_health: >-
           {{
             'HEALTHY'
             if
             (
+              auditd_service_status.rc == 0
+              and
               chrony_service_status.rc == 0
               and
               rsyslog_service_status.rc == 0
-              and
-              auditd_service_status.rc == 0
             )
-            else 'FAILED'
+            else
+            'FAILED'
           }}
 
+
+    # =================================================================
+    # 46. OVERALL HEALTH
+    # =================================================================
 
     - name: Calculate overall health
       ansible.builtin.set_fact:
@@ -1250,25 +1450,31 @@
             'HEALTHY'
             if
             (
-              uems_health == 'HEALTHY'
+              uems_health in ['HEALTHY', 'NOT_ENABLED']
               and
-              wazuh_health == 'HEALTHY'
+              wazuh_health in ['HEALTHY', 'NOT_ENABLED']
               and
-              zabbix_health == 'HEALTHY'
+              zabbix_health in ['HEALTHY', 'NOT_ENABLED']
               and
               system_services_health == 'HEALTHY'
               and
-              failed_services.stdout | trim == ''
+              (
+                failed_services.stdout
+                | default('')
+                | trim
+                == ''
+              )
             )
-            else 'ATTENTION_REQUIRED'
+            else
+            'ATTENTION_REQUIRED'
           }}
 
 
-    # ============================================================
-    # 43. WRITE SERVER REPORT
-    # ============================================================
+    # =================================================================
+    # 47. REPORT DIRECTORY
+    # =================================================================
 
-    - name: Create report directory
+    - name: Create security report directory
       ansible.builtin.file:
         path: "/var/log/ubuntu-enterprise"
         state: directory
@@ -1277,7 +1483,11 @@
         mode: "0755"
 
 
-    - name: Generate final server health report
+    # =================================================================
+    # 48. FINAL REPORT
+    # =================================================================
+
+    - name: Generate final security report
       ansible.builtin.copy:
         dest: "/var/log/ubuntu-enterprise/security-stack-report.txt"
         owner: root
@@ -1293,7 +1503,7 @@
           Hostname              : {{ ansible_hostname }}
           FQDN                  : {{ ansible_fqdn }}
           IP Address            : {{ ansible_default_ipv4.address | default('N/A') }}
-          Operating System      : {{ ansible_distribution }} {{ ansible_distribution_version }}
+          OS                    : {{ ansible_distribution }} {{ ansible_distribution_version }}
           Kernel                : {{ ansible_kernel }}
           Architecture          : {{ ansible_architecture }}
           CPU Cores             : {{ ansible_processor_vcpus | default('N/A') }}
@@ -1303,90 +1513,134 @@
           Memory Usage          : {{ memory_usage.stdout }}%
           Load Average          : {{ load_average.stdout }}
 
-          UEMS / ENDPOINT CENTRAL
-          ----------------------------------------------------------------
+          ================================================================
+          UEMS / MANAGEENGINE ENDPOINT CENTRAL
+          ================================================================
+
           Enabled               : {{ uems_enabled }}
-          Installed             : {{ uems_installed | default(false) }}
+          Installed             : {{ uems_installed }}
           Installation Path     : {{ uems_install_dir }}
-          Version               : {{ uems_version | default('UNKNOWN') }}
-          Service               : {{ uems_service_name | default('NOT DETECTED') }}
-          Service Status        : {{ uems_service_status.stdout | default('NOT DETECTED') }}
+          Version               : {{ uems_version }}
+          Service               : {{ uems_service_name | default('NOT_DETECTED') }}
+          Service Status        : {{ uems_service_status.stdout | default('NOT_DETECTED') }}
+          Process               : {{ uems_process_after_install.stdout | default('NOT_DETECTED') | trim }}
           Health                : {{ uems_health }}
 
+          ================================================================
           WAZUH AGENT
-          ----------------------------------------------------------------
+          ================================================================
+
           Enabled               : {{ wazuh_enabled }}
-          Installed             : {{ wazuh_installed | default(false) }}
+          Installed             : {{ wazuh_installed }}
           Manager               : {{ wazuh_manager_ip }}
-          Version               : {{ wazuh_version_result.stdout | default('UNKNOWN') }}
-          Service Status        : {{ wazuh_service_status.stdout | default('NOT DETECTED') }}
+          Version               : {{ wazuh_final_version.stdout | default('UNKNOWN') }}
+          Service Status        : {{ wazuh_service_status.stdout | default('NOT_DETECTED') }}
           Health                : {{ wazuh_health }}
 
-          ZABBIX AGENT 2
-          ----------------------------------------------------------------
+          ================================================================
+          ZABBIX
+          ================================================================
+
           Enabled               : {{ zabbix_enabled }}
-          Installed             : {{ zabbix_installed | default(false) }}
-          Server                : {{ zabbix_server_ip }}
-          Version               : {{ zabbix_version_result.stdout | default('UNKNOWN') }}
-          Service Status        : {{ zabbix_service_status.stdout | default('NOT DETECTED') }}
-          Health                : {{ zabbix_health }}
 
-          SYSTEM SERVICES
+          Zabbix Agent Installed:
+                                  {{ zabbix_agent_installed }}
+
+          Zabbix Agent Version   :
+                                  {{ zabbix_final_agent_version.stdout }}
+
+          Zabbix Agent Service   :
+                                  {{ zabbix_agent_service_status.stdout | default('NOT_DETECTED') }}
+
+          Zabbix Agent 2 Installed:
+                                  {{ zabbix_agent2_installed }}
+
+          Zabbix Agent 2 Version :
+                                  {{ zabbix_final_agent2_version.stdout }}
+
+          Zabbix Agent 2 Service  :
+                                  {{ zabbix_agent2_service_status.stdout | default('NOT_DETECTED') }}
+
+          Zabbix Health           :
+                                  {{ zabbix_health }}
+
+          ================================================================
+          SYSTEM SECURITY SERVICES
+          ================================================================
+
+          Auditd
           ----------------------------------------------------------------
-          Auditd Version        : {{ auditd_version_result.stdout }}
-          Auditd Service        : {{ auditd_service_status.stdout }}
+          Version               : {{ auditd_version.stdout }}
+          Service               : {{ auditd_service_status.stdout }}
 
-          Chrony Version        : {{ chrony_version_result.stdout }}
-          Chrony Service        : {{ chrony_service_status.stdout }}
-
-          Rsyslog Version       : {{ rsyslog_version_result.stdout }}
-          Rsyslog Service       : {{ rsyslog_service_status.stdout }}
-
-          System Services Health: {{ system_services_health }}
-
-          FAILED SERVICES
+          Chrony
           ----------------------------------------------------------------
-          {{ failed_services.stdout | default('NONE') }}
+          Version               : {{ chrony_version.stdout }}
+          Service               : {{ chrony_service_status.stdout }}
 
+          Rsyslog
+          ----------------------------------------------------------------
+          Version               : {{ rsyslog_version.stdout }}
+          Service               : {{ rsyslog_service_status.stdout }}
+
+          System Services Health : {{ system_services_health }}
+
+          ================================================================
           PATCH MANAGEMENT
-          ----------------------------------------------------------------
-          Enabled               : {{ patch_management_enabled }}
-          Automatic Security Updates: {{ unattended_security_updates }}
+          ================================================================
+
+          Patch Management      : {{ patch_management_enabled }}
+          Automatic Updates     : {{ unattended_security_updates }}
           Pending Updates       : {{ pending_updates.stdout | default('N/A') }}
           Security Updates      : {{ pending_security_updates.stdout | default('N/A') }}
           Reboot Required       : {{ reboot_required.stat.exists }}
 
-          INSTALLED SECURITY SOFTWARE
-          ----------------------------------------------------------------
+          ================================================================
+          FAILED SYSTEMD SERVICES
+          ================================================================
+
+          {{ failed_services.stdout | default('NONE') | trim }}
+
+          ================================================================
+          SECURITY SOFTWARE INVENTORY
+          ================================================================
+
           {{ security_software_inventory.stdout }}
 
+          ================================================================
           COMPLETE SOFTWARE INVENTORY
-          ----------------------------------------------------------------
-          Total Packages       : {{ installed_package_count }}
+          ================================================================
+
+          Total Installed Packages:
+          {{ installed_package_count }}
 
           {{ complete_software_inventory.stdout }}
 
           ================================================================
-          FINAL STATUS
+          FINAL HEALTH
           ================================================================
+
           UEMS                  : {{ uems_health }}
           Wazuh                 : {{ wazuh_health }}
           Zabbix                : {{ zabbix_health }}
           System Services       : {{ system_services_health }}
           Overall               : {{ overall_health }}
+
+          ================================================================
+          REPORT GENERATED BY ANSIBLE
           ================================================================
 
 
-    # ============================================================
-    # 44. DISPLAY FINAL REPORT
-    # ============================================================
+    # =================================================================
+    # 49. FINAL CONSOLE REPORT
+    # =================================================================
 
     - name: Display final health report
       ansible.builtin.debug:
         msg:
           - ""
           - "================================================================"
-          - "        UBUNTU ENTERPRISE SECURITY HEALTH REPORT"
+          - "       UBUNTU ENTERPRISE SECURITY HEALTH REPORT"
           - "================================================================"
           - ""
           - "SERVER"
@@ -1400,28 +1654,37 @@
           - "Memory Usage         : {{ memory_usage.stdout }}%"
           - "Load Average         : {{ load_average.stdout }}"
           - ""
-          - "UEMS / ENDPOINT CENTRAL"
+          - "UEMS"
           - "----------------------------------------------------------------"
-          - "Installed            : {{ uems_installed | default(false) }}"
-          - "Path                 : {{ uems_install_dir }}"
-          - "Version              : {{ uems_version | default('UNKNOWN') }}"
-          - "Service              : {{ uems_service_name | default('NOT DETECTED') }}"
-          - "Service Status       : {{ uems_service_status.stdout | default('NOT DETECTED') }}"
+          - "Installed            : {{ uems_installed }}"
+          - "Version              : {{ uems_version }}"
+          - "Service              : {{ uems_service_name | default('NOT_DETECTED') }}"
+          - "Service Status       : {{ uems_service_status.stdout | default('NOT_DETECTED') }}"
           - "Health               : {{ uems_health }}"
           - ""
           - "WAZUH"
           - "----------------------------------------------------------------"
-          - "Installed            : {{ wazuh_installed | default(false) }}"
-          - "Version              : {{ wazuh_version_result.stdout | default('UNKNOWN') }}"
-          - "Service Status       : {{ wazuh_service_status.stdout | default('NOT DETECTED') }}"
+          - "Installed            : {{ wazuh_installed }}"
+          - "Version              : {{ wazuh_final_version.stdout | default('UNKNOWN') }}"
+          - "Service Status       : {{ wazuh_service_status.stdout | default('NOT_DETECTED') }}"
           - "Health               : {{ wazuh_health }}"
           - ""
           - "ZABBIX"
           - "----------------------------------------------------------------"
-          - "Installed            : {{ zabbix_installed | default(false) }}"
-          - "Version              : {{ zabbix_version_result.stdout | default('UNKNOWN') }}"
-          - "Service Status       : {{ zabbix_service_status.stdout | default('NOT DETECTED') }}"
+          - "Agent Installed      : {{ zabbix_agent_installed }}"
+          - "Agent Version        : {{ zabbix_final_agent_version.stdout }}"
+          - "Agent Service        : {{ zabbix_agent_service_status.stdout | default('NOT_DETECTED') }}"
+          - "Agent 2 Installed    : {{ zabbix_agent2_installed }}"
+          - "Agent 2 Version      : {{ zabbix_final_agent2_version.stdout }}"
+          - "Agent 2 Service      : {{ zabbix_agent2_service_status.stdout | default('NOT_DETECTED') }}"
           - "Health               : {{ zabbix_health }}"
+          - ""
+          - "SYSTEM SERVICES"
+          - "----------------------------------------------------------------"
+          - "Auditd               : {{ auditd_service_status.stdout }}"
+          - "Chrony               : {{ chrony_service_status.stdout }}"
+          - "Rsyslog              : {{ rsyslog_service_status.stdout }}"
+          - "Health               : {{ system_services_health }}"
           - ""
           - "PATCH MANAGEMENT"
           - "----------------------------------------------------------------"
@@ -1429,12 +1692,9 @@
           - "Security Updates     : {{ pending_security_updates.stdout | default('N/A') }}"
           - "Reboot Required      : {{ reboot_required.stat.exists }}"
           - ""
-          - "SYSTEM"
+          - "FAILED SERVICES"
           - "----------------------------------------------------------------"
-          - "Auditd               : {{ auditd_service_status.stdout }}"
-          - "Chrony               : {{ chrony_service_status.stdout }}"
-          - "Rsyslog              : {{ rsyslog_service_status.stdout }}"
-          - "Failed Services      : {{ failed_services.stdout | default('NONE') }}"
+          - "{{ failed_services.stdout | default('NONE') | trim }}"
           - ""
           - "================================================================"
           - "OVERALL STATUS        : {{ overall_health }}"
@@ -1445,9 +1705,9 @@
           - ""
 
 
-  # ==============================================================
+  # =====================================================================
   # HANDLERS
-  # ==============================================================
+  # =====================================================================
 
   handlers:
 
