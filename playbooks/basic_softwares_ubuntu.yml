@@ -68,7 +68,7 @@
 
     wazuh_enabled: true
 
-    wazuh_manager_ip: "192.168.10.100"
+    wazuh_manager_ip: "192.168.10.54"
     wazuh_manager_port: 1514
     wazuh_registration_port: 1515
 
@@ -83,7 +83,7 @@
 
     zabbix_enabled: true
 
-    zabbix_server_ip: "192.168.10.101"
+    zabbix_server_ip: "192.168.10.216"
     zabbix_server_port: 10051
 
     zabbix_version: "7.0"
@@ -96,7 +96,7 @@
 
     # IMPORTANT:
     # Replace this with your approved Seqrite Linux installer.
-    seqrite_download_url: ""
+    seqrite_download_url: "http://192.168.10.10/Softwares/DefaultRemoteOffice_UEMSLinuxAgent.zip"
 
     seqrite_download_dir: "/opt/seqrite-installer"
 
