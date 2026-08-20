@@ -1,0 +1,465 @@
+---
+# Enterprise Linux Software + Kernel Update
+# Fixed shell syntax and Ubuntu 24.04 Generic/HWE kernel handling
+#
+# Audit only:
+#   ansible-playbook -i inventory.ini software_update_kernel_fixed_v2.yml -e update_packages=false
+#
+# Update packages + kernel, no reboot:
+#   ansible-playbook -i inventory.ini software_update_kernel_fixed_v2.yml -e update_packages=true -e reboot_if_required=false
+#
+# Update packages + kernel + reboot + verify:
+#   ansible-playbook -i inventory.ini software_update_kernel_fixed_v2.yml -e update_packages=true -e reboot_if_required=true
+
+- name: Enterprise Linux Software and Kernel Update
+  hosts: all
+  become: true
+  gather_facts: true
+
+  vars:
+    update_packages: true
+    update_kernel: true
+    update_snap: true
+    reboot_if_required: false
+    cleanup_packages: true
+    apt_update_cache: true
+    excluded_packages: []
+
+    report_directory: /var/log/ansible-software-update
+    report_file: /var/log/ansible-software-update/software-update-report.json
+
+  pre_tasks:
+    - name: Validate supported operating system
+      ansible.builtin.assert:
+        that:
+          - ansible_distribution in ['Ubuntu', 'Debian']
+        fail_msg: >-
+          Unsupported OS: {{ ansible_distribution }} {{ ansible_distribution_version }}.
+          This playbook supports Ubuntu and Debian.
+
+    - name: Create report directory
+      ansible.builtin.file:
+        path: "{{ report_directory }}"
+        state: directory
+        owner: root
+        group: root
+        mode: '0750'
+
+  tasks:
+    # ==========================================================
+    # BEFORE STATE
+    # ==========================================================
+
+    - name: Get current running kernel
+      ansible.builtin.command: uname -r
+      register: kernel_before
+      changed_when: false
+
+    - name: Get current architecture
+      ansible.builtin.command: uname -m
+      register: arch_result
+      changed_when: false
+
+    - name: Gather installed package facts
+      ansible.builtin.package_facts:
+        manager: auto
+
+    - name: Detect Ubuntu kernel track
+      ansible.builtin.set_fact:
+        kernel_track: >-
+          {{
+            'hwe'
+            if ('linux-image-generic-hwe-24.04' in ansible_facts.packages
+                or kernel_before.stdout is search('^[0-9]+\.[0-9]+\.[0-9]+-[0-9]+-generic$') and 'linux-image-generic' in ansible_facts.packages and 'linux-image-generic-hwe-24.04' in ansible_facts.packages)
+            else 'generic'
+          }}
+      when: ansible_distribution == 'Ubuntu'
+
+    - name: Set Debian kernel track
+      ansible.builtin.set_fact:
+        kernel_track: debian
+      when: ansible_distribution == 'Debian'
+
+    - name: Select Ubuntu kernel meta-packages
+      ansible.builtin.set_fact:
+        kernel_image_meta_package: >-
+          {{ 'linux-image-generic-hwe-24.04' if kernel_track == 'hwe' else 'linux-image-generic' }}
+        kernel_headers_meta_package: >-
+          {{ 'linux-headers-generic-hwe-24.04' if kernel_track == 'hwe' else 'linux-headers-generic' }}
+      when: ansible_distribution == 'Ubuntu'
+
+    - name: Select Debian kernel meta-packages
+      ansible.builtin.set_fact:
+        kernel_image_meta_package: linux-image-amd64
+        kernel_headers_meta_package: linux-headers-amd64
+      when: ansible_distribution == 'Debian'
+
+    - name: Update APT package cache
+      ansible.builtin.apt:
+        update_cache: true
+        cache_valid_time: 0
+      when: apt_update_cache
+
+    - name: Collect installed package count
+      ansible.builtin.shell: "dpkg-query -W -f='${binary:Package}\\n' | wc -l"
+      register: installed_count_before
+      changed_when: false
+
+    - name: Collect available package updates
+      ansible.builtin.shell: |
+        apt-get -s dist-upgrade | awk '/^Inst / {print $2 " -> " $3}'
+      register: available_updates_before
+      changed_when: false
+      failed_when: false
+
+    - name: Collect installed kernel packages
+      ansible.builtin.shell: >-
+        dpkg-query -W -f='${binary:Package}\t${Version}\t${Status}\n' |
+        awk '$3 == "install" && $4 == "ok" && $5 == "installed" && $1 ~ /^(linux-image|linux-modules|linux-headers)-/ {print}'
+      register: kernel_packages_before
+      changed_when: false
+
+    - name: Find installed kernel image files
+      ansible.builtin.find:
+        paths: /boot
+        patterns:
+          - 'vmlinuz-*'
+        file_type: file
+        recurse: false
+      register: kernel_files_before
+      changed_when: false
+
+    - name: Determine newest installed kernel image
+      ansible.builtin.shell: >
+        ls -1 /boot/vmlinuz-* 2>/dev/null |
+        sed 's#^/boot/vmlinuz-##' |
+        sort -V |
+        tail -n 1
+      register: newest_kernel_before_cmd
+      changed_when: false
+      failed_when: false
+
+    - name: Set newest installed kernel before update
+      ansible.builtin.set_fact:
+        newest_kernel_before: "{{ newest_kernel_before_cmd.stdout | trim }}"
+
+    - name: Check reboot requirement before update
+      ansible.builtin.stat:
+        path: /var/run/reboot-required
+      register: reboot_marker_before
+
+    - name: Display current kernel state
+      ansible.builtin.debug:
+        msg:
+          - "Host: {{ ansible_hostname }}"
+          - "OS: {{ ansible_distribution }} {{ ansible_distribution_version }}"
+          - "Architecture: {{ arch_result.stdout }}"
+          - "Running kernel: {{ kernel_before.stdout }}"
+          - "Kernel track: {{ kernel_track }}"
+          - "Kernel meta-package: {{ kernel_image_meta_package }}"
+          - "Newest installed kernel: {{ newest_installed_kernel_before.stdout | default('unknown', true) }}"
+          - "Reboot required before update: {{ reboot_marker_before.stat.exists }}"
+
+    # ==========================================================
+    # SOFTWARE UPDATE
+    # ==========================================================
+
+    - name: Upgrade all APT packages
+      ansible.builtin.apt:
+        upgrade: dist
+        update_cache: false
+        autoremove: false
+        autoclean: false
+      when:
+        - update_packages
+        - excluded_packages | length == 0
+
+    - name: Get installed package names for selective upgrade
+      ansible.builtin.shell: "dpkg-query -W -f='${binary:Package}\\n'"
+      register: installed_package_names
+      changed_when: false
+      when:
+        - update_packages
+        - excluded_packages | length > 0
+
+    - name: Build selective package list
+      ansible.builtin.set_fact:
+        selectable_packages: >-
+          {{
+            installed_package_names.stdout_lines |
+            reject('match', '^(' ~ (excluded_packages | map('regex_escape') | join('|')) ~ ')$') |
+            list
+          }}
+      when:
+        - update_packages
+        - excluded_packages | length > 0
+
+    - name: Upgrade selected APT packages
+      ansible.builtin.apt:
+        name: "{{ selectable_packages }}"
+        state: latest
+        update_cache: false
+      when:
+        - update_packages
+        - excluded_packages | length > 0
+        - selectable_packages | length > 0
+
+    # ==========================================================
+    # KERNEL UPDATE - TRACK AWARE
+    # ==========================================================
+
+    - name: Upgrade detected kernel meta-package
+      ansible.builtin.apt:
+        name:
+          - "{{ kernel_image_meta_package }}"
+          - "{{ kernel_headers_meta_package }}"
+        state: latest
+        update_cache: false
+        install_recommends: true
+      register: kernel_meta_update
+      when:
+        - update_packages
+        - update_kernel
+
+    - name: Ensure kernel packages are configured
+      ansible.builtin.command: dpkg --configure -a
+      register: dpkg_configure
+      changed_when: false
+      failed_when: dpkg_configure.rc != 0
+      when: update_packages
+
+    - name: Repair broken dependencies if required
+      ansible.builtin.command: apt-get -f install -y
+      register: apt_fix
+      changed_when: false
+      failed_when: apt_fix.rc != 0
+      when: update_packages
+
+    - name: Refresh all initramfs images
+      ansible.builtin.command: update-initramfs -u -k all
+      register: initramfs_update
+      changed_when: false
+      failed_when: initramfs_update.rc != 0
+      when:
+        - update_packages
+        - update_kernel
+
+    - name: Update GRUB configuration
+      ansible.builtin.command: update-grub
+      register: grub_update
+      changed_when: false
+      failed_when: grub_update.rc != 0
+      when:
+        - update_packages
+        - update_kernel
+
+    # ==========================================================
+    # SNAP UPDATE
+    # ==========================================================
+
+    - name: Check for snap command
+      ansible.builtin.command: command -v snap
+      register: snap_command
+      changed_when: false
+      failed_when: false
+
+    - name: Refresh snap packages
+      ansible.builtin.command: snap refresh
+      register: snap_refresh
+      changed_when: >-
+        snap_refresh.rc == 0 and 'All snaps up to date' not in snap_refresh.stdout
+      failed_when: snap_refresh.rc != 0
+      when:
+        - update_packages
+        - update_snap
+        - snap_command.rc == 0
+
+    # ==========================================================
+    # AFTER UPDATE - KERNEL AND REBOOT STATE
+    # ==========================================================
+
+    - name: Find installed kernel image files after update
+      ansible.builtin.find:
+        paths: /boot
+        patterns:
+          - 'vmlinuz-*'
+        file_type: file
+        recurse: false
+      register: kernel_files_after
+      changed_when: false
+
+    - name: Determine newest installed kernel image after update
+      ansible.builtin.shell: >
+        ls -1 /boot/vmlinuz-* 2>/dev/null |
+        sed 's#^/boot/vmlinuz-##' |
+        sort -V |
+        tail -n 1
+      register: newest_kernel_after_cmd
+      changed_when: false
+      failed_when: false
+
+    - name: Set newest installed kernel after update
+      ansible.builtin.set_fact:
+        newest_kernel_after: "{{ newest_kernel_after_cmd.stdout | trim }}"
+
+    - name: Check reboot-required marker
+      ansible.builtin.stat:
+        path: /var/run/reboot-required
+      register: reboot_required_file
+
+    - name: Read reboot-required packages
+      ansible.builtin.command: cat /var/run/reboot-required.pkgs
+      register: reboot_required_packages
+      changed_when: false
+      failed_when: false
+      when: reboot_required_file.stat.exists
+
+    - name: Set reboot status
+      ansible.builtin.set_fact:
+        reboot_required: >-
+          {{
+            reboot_required_file.stat.exists
+            or
+            (
+              newest_installed_kernel_after | length > 0 and
+              newest_installed_kernel_after != kernel_before.stdout
+            )
+          }}
+
+    - name: Display kernel update result
+      ansible.builtin.debug:
+        msg:
+          - "Running kernel before: {{ kernel_before.stdout }}"
+          - "Newest installed kernel after: {{ newest_installed_kernel_after | default('unknown', true) }}"
+          - "Kernel meta-package changed: {{ kernel_meta_update.changed | default(false) }}"
+          - "Reboot required: {{ reboot_required }}"
+          - "Reboot packages: {{ reboot_required_packages.stdout_lines | default([]) }}"
+
+    # ==========================================================
+    # OPTIONAL REBOOT AND VERIFY
+    # ==========================================================
+
+    - name: Reboot to activate newly installed kernel
+      ansible.builtin.reboot:
+        msg: "Ansible kernel/software update - rebooting to activate latest kernel"
+        reboot_timeout: 1800
+        connect_timeout: 30
+        pre_reboot_delay: 5
+        post_reboot_delay: 30
+        test_command: uname -r
+      when:
+        - update_packages
+        - reboot_if_required
+        - reboot_required
+
+    - name: Get running kernel after optional reboot
+      ansible.builtin.command: uname -r
+      register: kernel_after
+      changed_when: false
+
+    - name: Verify newest kernel is running when reboot was requested
+      ansible.builtin.assert:
+        that:
+          - kernel_after.stdout == newest_installed_kernel_after
+        fail_msg: >-
+          Kernel update was installed but the newest kernel is not running.
+          Running={{ kernel_after.stdout }};
+          newest_installed={{ newest_installed_kernel_after }}.
+          A reboot may still be required or GRUB may have selected another kernel.
+        success_msg: >-
+          Kernel verification PASSED. Running kernel={{ kernel_after.stdout }}.
+      when:
+        - update_packages
+        - update_kernel
+        - reboot_if_required
+        - reboot_required
+        - newest_installed_kernel_after | length > 0
+
+    # ==========================================================
+    # CLEANUP AND VALIDATION
+    # ==========================================================
+
+    - name: Remove unused packages and clean APT cache
+      ansible.builtin.apt:
+        autoremove: true
+        autoclean: true
+      when:
+        - update_packages
+        - cleanup_packages
+
+    - name: Check dpkg database
+      ansible.builtin.command: dpkg --audit
+      register: dpkg_audit
+      changed_when: false
+      failed_when: false
+
+    - name: Check APT dependency health
+      ansible.builtin.command: apt-get check
+      register: apt_check
+      changed_when: false
+      failed_when: false
+
+    - name: Get final installed package count
+      ansible.builtin.shell: "dpkg-query -W -f='${binary:Package}\\n' | wc -l"
+      register: installed_count_after
+      changed_when: false
+
+    - name: Get remaining package updates
+      ansible.builtin.shell: |
+        apt-get -s dist-upgrade | awk '/^Inst / {print $2 " -> " $3}'
+      register: remaining_updates
+      changed_when: false
+      failed_when: false
+
+    - name: Save JSON report
+      ansible.builtin.copy:
+        dest: "{{ report_file }}"
+        owner: root
+        group: root
+        mode: '0640'
+        content: |
+          {
+            "hostname": {{ ansible_hostname | to_json }},
+            "os": {{ ansible_distribution | to_json }},
+            "os_version": {{ ansible_distribution_version | to_json }},
+            "architecture": {{ arch_result.stdout | to_json }},
+            "kernel": {
+              "track": {{ kernel_track | to_json }},
+              "meta_package": {{ kernel_image_meta_package | to_json }},
+              "running_before": {{ kernel_before.stdout | to_json }},
+              "newest_installed": {{ newest_installed_kernel_after | to_json }},
+              "running_after": {{ kernel_after.stdout | to_json }},
+              "reboot_required": {{ reboot_required | bool | to_json }},
+              "reboot_performed": {{ (update_packages and reboot_if_required and reboot_required) | bool | to_json }}
+            },
+            "software": {
+              "installed_packages_before": {{ installed_count_before.stdout | trim | int }},
+              "installed_packages_after": {{ installed_count_after.stdout | trim | int }},
+              "updates_before": {{ available_updates_before.stdout_lines | to_json }},
+              "updates_remaining": {{ remaining_updates.stdout_lines | to_json }}
+            },
+            "validation": {
+              "dpkg_audit_rc": {{ dpkg_audit.rc }},
+              "apt_check_rc": {{ apt_check.rc }}
+            }
+          }
+
+    - name: Display final summary
+      ansible.builtin.debug:
+        msg:
+          - "============================================================"
+          - "ENTERPRISE SOFTWARE + KERNEL UPDATE SUMMARY"
+          - "============================================================"
+          - "Host: {{ ansible_hostname }}"
+          - "OS: {{ ansible_distribution }} {{ ansible_distribution_version }}"
+          - "Kernel track: {{ kernel_track }}"
+          - "Kernel meta-package: {{ kernel_image_meta_package }}"
+          - "Kernel before: {{ kernel_before.stdout }}"
+          - "Newest installed kernel: {{ newest_installed_kernel_after | default('unknown', true) }}"
+          - "Kernel running now: {{ kernel_after.stdout }}"
+          - "Reboot required: {{ reboot_required }}"
+          - "Updates remaining: {{ remaining_updates.stdout_lines | length }}"
+          - "DPKG audit: {{ 'PASS' if dpkg_audit.rc == 0 else 'CHECK REQUIRED' }}"
+          - "APT check: {{ 'PASS' if apt_check.rc == 0 else 'CHECK REQUIRED' }}"
+          - "Report: {{ report_file }}"
+          - "============================================================"
