@@ -1,6 +1,6 @@
 ---
 - name: Production-safe GitLab Runner upgrade with automatic rollback
-  hosts: gitlab_runners
+  hosts: all
   become: true
   gather_facts: true
 
