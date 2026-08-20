@@ -1,0 +1,731 @@
+---
+# ============================================================
+# ENTERPRISE LINUX SOFTWARE + KERNEL LIFECYCLE v7
+# Ubuntu 24.04 / Debian
+#
+# v7 changes:
+#   - Automatic reboot enabled by default
+#   - Explicit kernel candidate discovery
+#   - Installs kernel meta + image + headers with recommends
+#   - Verifies newest installed kernel
+#   - Reboots when a newer kernel is installed
+#   - Verifies uname -r after reboot
+#   - Fails if a newer installed kernel is not activated
+#   - Self-heals dpkg/APT
+#   - Safely disables invalid third-party APT sources
+#   - Updates APT + Snap packages
+#   - Produces JSON report
+#
+# IMPORTANT:
+#   "Latest" means the latest stable kernel exposed by the
+#   configured Ubuntu/Debian repositories. This playbook does
+#   NOT use an unsupported "-edge" HWE track automatically.
+# ============================================================
+
+- name: Enterprise Linux Software and Kernel Lifecycle v7
+  hosts: all
+  become: true
+  gather_facts: true
+  serial: 1
+
+  vars:
+    update_packages: true
+    update_kernel: true
+    update_snap: true
+
+    # v7: automatic kernel activation
+    reboot_if_required: true
+
+    cleanup_packages: true
+    self_heal: true
+    disable_invalid_repositories: true
+
+    reboot_timeout: 900
+    post_reboot_delay: 30
+
+    report_directory: /var/log/ansible-software-update
+    report_file: /var/log/ansible-software-update/software-update-report.json
+
+    excluded_packages: []
+
+  pre_tasks:
+
+    - name: Validate supported OS
+      ansible.builtin.assert:
+        that:
+          - ansible_distribution in ['Ubuntu', 'Debian']
+        fail_msg: "Unsupported OS: {{ ansible_distribution }}"
+
+    - name: Create report directory
+      ansible.builtin.file:
+        path: "{{ report_directory }}"
+        state: directory
+        owner: root
+        group: root
+        mode: "0750"
+
+    - name: Detect running kernel
+      ansible.builtin.command: uname -r
+      register: kernel_before_cmd
+      changed_when: false
+
+    - name: Set running kernel before
+      ansible.builtin.set_fact:
+        kernel_running_before: "{{ kernel_before_cmd.stdout | trim }}"
+
+  tasks:
+
+    # ========================================================
+    # APT / DPKG SELF-HEALING
+    # ========================================================
+
+    - name: Check dpkg audit
+      ansible.builtin.command: dpkg --audit
+      register: dpkg_audit_before
+      changed_when: false
+      failed_when: false
+
+    - name: Repair interrupted dpkg configuration
+      ansible.builtin.command: dpkg --configure -a
+      register: dpkg_repair
+      changed_when: true
+      failed_when: false
+      when:
+        - self_heal
+        - dpkg_audit_before.stdout | trim | length > 0
+
+    - name: Repair broken dependencies
+      ansible.builtin.command: apt-get -f install -y
+      register: dependency_repair
+      changed_when: true
+      failed_when: false
+      when: self_heal
+
+    - name: Refresh APT cache
+      ansible.builtin.command: apt-get update
+      register: apt_update_first
+      changed_when: false
+      failed_when: false
+
+    - name: Build APT error text
+      ansible.builtin.set_fact:
+        apt_error_text: >-
+          {{
+            (apt_update_first.stdout | default('')) ~ '\n' ~
+            (apt_update_first.stderr | default(''))
+          }}
+
+    - name: Detect invalid Release repositories
+      ansible.builtin.set_fact:
+        invalid_release_detected: >-
+          {{
+            'does not have a Release file' in apt_error_text
+            or '404 Not Found' in apt_error_text
+            or '404  Not Found' in apt_error_text
+          }}
+
+    - name: Extract repository URLs from APT failure
+      ansible.builtin.shell: |
+        printf '%s\n' "$APT_ERRORS" |
+        grep -Eo 'https?://[^[:space:]]+' |
+        sed 's/[),;]$//' |
+        sort -u || true
+      environment:
+        APT_ERRORS: "{{ apt_error_text }}"
+      register: bad_repository_urls
+      changed_when: false
+      when: invalid_release_detected
+
+    - name: Back up and disable clearly invalid third-party sources
+      ansible.builtin.shell: |
+        set -u
+        backup="/etc/apt/sources.list.d/ansible-disabled"
+        mkdir -p "$backup"
+        changed=0
+
+        is_protected() {
+          case "$1" in
+            *archive.ubuntu.com*|*security.ubuntu.com*|*ports.ubuntu.com*|\
+            *old-releases.ubuntu.com*|*archive.debian.org*|*security.debian.org*)
+              return 0 ;;
+            *) return 1 ;;
+          esac
+        }
+
+        while IFS= read -r url; do
+          [ -n "$url" ] || continue
+          is_protected "$url" && continue
+
+          for f in /etc/apt/sources.list.d/*.list /etc/apt/sources.list.d/*.sources; do
+            [ -f "$f" ] || continue
+
+            if grep -qF "$url" "$f"; then
+              cp -a "$f" "$backup/$(basename "$f").$(date +%Y%m%d%H%M%S).bak"
+
+              case "$f" in
+                *.list)
+                  sed -i -E 's/^[[:space:]]*deb[[:space:]]+/# disabled-by-ansible: deb /' "$f"
+                  sed -i -E 's/^[[:space:]]*deb-src[[:space:]]+/# disabled-by-ansible: deb-src /' "$f"
+                  ;;
+                *.sources)
+                  sed -i -E 's/^[[:space:]]*(Types:|URIs:|Suites:|Components:|Architectures:)/# disabled-by-ansible: \1/' "$f"
+                  ;;
+              esac
+
+              echo "$f"
+              changed=1
+              break
+            fi
+          done
+        done <<'URLS'
+        {{ bad_repository_urls.stdout | default('') }}
+        URLS
+
+        exit 0
+      args:
+        executable: /bin/bash
+      register: repository_repair
+      changed_when: repository_repair.stdout | trim | length > 0
+      failed_when: false
+      when:
+        - self_heal
+        - disable_invalid_repositories
+        - invalid_release_detected
+        - bad_repository_urls.stdout | default('') | trim | length > 0
+
+    - name: Retry APT update after repository repair
+      ansible.builtin.command: apt-get update
+      register: apt_update_final
+      changed_when: false
+      failed_when: false
+      when: invalid_release_detected
+
+    - name: Use initial APT result when no repair was required
+      ansible.builtin.set_fact:
+        apt_health_result: "{{ apt_update_final if invalid_release_detected else apt_update_first }}"
+
+    - name: Fail when APT is still unhealthy
+      ansible.builtin.fail:
+        msg: |
+          APT repository/update failure remains after self-healing.
+
+          STDOUT:
+          {{ apt_health_result.stdout | default('') }}
+
+          STDERR:
+          {{ apt_health_result.stderr | default('') }}
+      when: apt_health_result.rc | default(1) != 0
+
+    # ========================================================
+    # PACKAGE INVENTORY
+    # ========================================================
+
+    - name: Count installed packages before
+      ansible.builtin.shell: dpkg-query -W -f='${binary:Package}\n' | wc -l
+      register: package_count_before
+      changed_when: false
+
+    - name: Count available package updates
+      ansible.builtin.shell: apt list --upgradable 2>/dev/null | tail -n +2 | wc -l
+      register: package_updates_before
+      changed_when: false
+
+    - name: Count security updates
+      ansible.builtin.shell: |
+        apt list --upgradable 2>/dev/null |
+        grep -Ei 'security|security.ubuntu.com|security.debian.org' |
+        wc -l || true
+      register: security_updates_before
+      changed_when: false
+
+    # ========================================================
+    # KERNEL TRACK DETECTION
+    # ========================================================
+
+    - name: Check Ubuntu HWE meta package
+      ansible.builtin.shell: |
+        dpkg-query -W -f='${Status}' linux-image-generic-hwe-{{ ansible_distribution_version }} 2>/dev/null |
+        grep -q 'install ok installed'
+      register: hwe_installed
+      changed_when: false
+      failed_when: false
+      when: ansible_distribution == 'Ubuntu'
+
+    - name: Set kernel track
+      ansible.builtin.set_fact:
+        kernel_track: "{{ 'hwe' if (ansible_distribution == 'Ubuntu' and hwe_installed.rc == 0) else 'generic' }}"
+      when: ansible_distribution == 'Ubuntu'
+
+    - name: Set Debian kernel track
+      ansible.builtin.set_fact:
+        kernel_track: debian
+      when: ansible_distribution == 'Debian'
+
+    - name: Set Ubuntu HWE kernel packages
+      ansible.builtin.set_fact:
+        kernel_meta_package: "linux-generic-hwe-{{ ansible_distribution_version }}"
+        kernel_image_meta_package: "linux-image-generic-hwe-{{ ansible_distribution_version }}"
+        kernel_headers_meta_package: "linux-headers-generic-hwe-{{ ansible_distribution_version }}"
+      when:
+        - ansible_distribution == 'Ubuntu'
+        - kernel_track == 'hwe'
+
+    - name: Set Ubuntu generic kernel packages
+      ansible.builtin.set_fact:
+        kernel_meta_package: linux-generic
+        kernel_image_meta_package: linux-image-generic
+        kernel_headers_meta_package: linux-headers-generic
+      when:
+        - ansible_distribution == 'Ubuntu'
+        - kernel_track == 'generic'
+
+    - name: Set Debian kernel packages
+      ansible.builtin.set_fact:
+        kernel_meta_package: linux-image-amd64
+        kernel_image_meta_package: linux-image-amd64
+        kernel_headers_meta_package: linux-headers-amd64
+      when: ansible_distribution == 'Debian'
+
+    # ========================================================
+    # INSTALLED KERNEL DISCOVERY
+    # ========================================================
+
+    - name: Discover installed kernel images
+      ansible.builtin.shell: |
+        ls -1 /boot/vmlinuz-* 2>/dev/null |
+        sed 's#^/boot/vmlinuz-##' |
+        sort -V || true
+      register: installed_kernels_before_cmd
+      changed_when: false
+      failed_when: false
+
+    - name: Set installed kernels before
+      ansible.builtin.set_fact:
+        installed_kernels_before: "{{ installed_kernels_before_cmd.stdout_lines | default([]) }}"
+
+    - name: Set newest installed kernel before
+      ansible.builtin.set_fact:
+        newest_installed_kernel_before: >-
+          {{
+            installed_kernels_before[-1]
+            if installed_kernels_before | length > 0
+            else ''
+          }}
+
+    # ========================================================
+    # EXPLICIT APT KERNEL CANDIDATE DISCOVERY
+    # ========================================================
+
+    - name: Query kernel image candidate
+      ansible.builtin.shell: |
+        apt-cache policy "{{ kernel_image_meta_package }}" |
+        awk '/Candidate:/ {print $2; exit}'
+      register: kernel_image_candidate_cmd
+      changed_when: false
+      failed_when: false
+
+    - name: Query kernel meta candidate
+      ansible.builtin.shell: |
+        apt-cache policy "{{ kernel_meta_package }}" |
+        awk '/Candidate:/ {print $2; exit}'
+      register: kernel_meta_candidate_cmd
+      changed_when: false
+      failed_when: false
+
+    - name: Query installed kernel meta version
+      ansible.builtin.shell: |
+        dpkg-query -W -f='${Version}' "{{ kernel_meta_package }}" 2>/dev/null || true
+      register: kernel_meta_installed_cmd
+      changed_when: false
+      failed_when: false
+
+    - name: Set kernel candidate facts
+      ansible.builtin.set_fact:
+        kernel_image_candidate: "{{ kernel_image_candidate_cmd.stdout | trim }}"
+        kernel_meta_candidate: "{{ kernel_meta_candidate_cmd.stdout | trim }}"
+        kernel_meta_installed: "{{ kernel_meta_installed_cmd.stdout | trim }}"
+
+    - name: Determine whether kernel meta package needs update
+      ansible.builtin.shell: |
+        installed="{{ kernel_meta_installed }}"
+        candidate="{{ kernel_meta_candidate }}"
+
+        if [ -z "$candidate" ] || [ "$candidate" = "(none)" ]; then
+          echo "unknown"
+        elif [ -z "$installed" ]; then
+          echo "yes"
+        elif dpkg --compare-versions "$candidate" gt "$installed"; then
+          echo "yes"
+        else
+          echo "no"
+        fi
+      register: kernel_meta_update_needed_cmd
+      changed_when: false
+
+    - name: Set kernel update requirement
+      ansible.builtin.set_fact:
+        kernel_meta_update_needed: "{{ kernel_meta_update_needed_cmd.stdout | trim }}"
+
+    - name: Display kernel decision
+      ansible.builtin.debug:
+        msg:
+          - "Kernel track: {{ kernel_track }}"
+          - "Running: {{ kernel_running_before }}"
+          - "Newest installed: {{ newest_installed_kernel_before }}"
+          - "Image meta: {{ kernel_image_meta_package }}"
+          - "Image candidate: {{ kernel_image_candidate | default('NONE') }}"
+          - "Meta package: {{ kernel_meta_package }}"
+          - "Meta installed: {{ kernel_meta_installed | default('NONE') }}"
+          - "Meta candidate: {{ kernel_meta_candidate | default('NONE') }}"
+          - "Kernel meta update needed: {{ kernel_meta_update_needed }}"
+
+    # ========================================================
+    # KERNEL INSTALLATION
+    # ========================================================
+
+    - name: Install latest stable kernel meta packages
+      ansible.builtin.apt:
+        name:
+          - "{{ kernel_meta_package }}"
+          - "{{ kernel_image_meta_package }}"
+          - "{{ kernel_headers_meta_package }}"
+        state: latest
+        install_recommends: true
+        update_cache: false
+      register: kernel_install_result
+      when:
+        - update_packages
+        - update_kernel
+        - kernel_meta_update_needed in ['yes', 'unknown']
+
+    - name: Reinstall kernel meta packages if missing
+      ansible.builtin.apt:
+        name:
+          - "{{ kernel_meta_package }}"
+          - "{{ kernel_image_meta_package }}"
+          - "{{ kernel_headers_meta_package }}"
+        state: present
+        install_recommends: true
+        update_cache: false
+      register: kernel_present_result
+      when:
+        - update_packages
+        - update_kernel
+        - kernel_meta_installed | length == 0
+
+    - name: Repair dependencies after kernel installation
+      ansible.builtin.command: apt-get -f install -y
+      register: kernel_dependency_repair
+      changed_when: true
+      failed_when: false
+      when:
+        - update_packages
+        - update_kernel
+
+    - name: Rebuild initramfs
+      ansible.builtin.command: update-initramfs -u -k all
+      register: initramfs_result
+      changed_when: true
+      failed_when: false
+      when:
+        - update_packages
+        - update_kernel
+
+    - name: Update GRUB
+      ansible.builtin.command: update-grub
+      register: grub_result
+      changed_when: true
+      failed_when: false
+      when:
+        - update_packages
+        - update_kernel
+
+    # ========================================================
+    # VERIFY INSTALLED KERNEL
+    # ========================================================
+
+    - name: Discover installed kernels after kernel installation
+      ansible.builtin.shell: |
+        ls -1 /boot/vmlinuz-* 2>/dev/null |
+        sed 's#^/boot/vmlinuz-##' |
+        sort -V || true
+      register: installed_kernels_after_cmd
+      changed_when: false
+      failed_when: false
+
+    - name: Set installed kernels after
+      ansible.builtin.set_fact:
+        installed_kernels_after: "{{ installed_kernels_after_cmd.stdout_lines | default([]) }}"
+
+    - name: Set newest installed kernel after
+      ansible.builtin.set_fact:
+        newest_installed_kernel_after: >-
+          {{
+            installed_kernels_after[-1]
+            if installed_kernels_after | length > 0
+            else ''
+          }}
+
+    - name: Verify kernel installation
+      ansible.builtin.assert:
+        that:
+          - newest_installed_kernel_after | length > 0
+        fail_msg: "No kernel image found under /boot after kernel update."
+      when:
+        - update_packages
+        - update_kernel
+
+    # ========================================================
+    # NORMAL SOFTWARE UPDATES
+    # ========================================================
+
+    - name: Upgrade all installed APT packages
+      ansible.builtin.apt:
+        name: "*"
+        state: latest
+        only_upgrade: true
+        update_cache: false
+        autoremove: false
+      register: apt_package_upgrade
+      when:
+        - update_packages
+        - excluded_packages | length == 0
+
+    - name: Get installed package names for exclusion handling
+      ansible.builtin.shell: dpkg-query -W -f='${binary:Package}\n'
+      register: package_names
+      changed_when: false
+      when:
+        - update_packages
+        - excluded_packages | length > 0
+
+    - name: Upgrade packages excluding configured exclusions
+      ansible.builtin.apt:
+        name: "{{ package_names.stdout_lines | difference(excluded_packages) }}"
+        state: latest
+        only_upgrade: true
+        update_cache: false
+      register: apt_package_upgrade
+      when:
+        - update_packages
+        - excluded_packages | length > 0
+
+    # ========================================================
+    # SNAP
+    # ========================================================
+
+    - name: Detect Snap
+      ansible.builtin.command: snap version
+      register: snap_detect
+      changed_when: false
+      failed_when: false
+
+    - name: Refresh Snap packages
+      ansible.builtin.command: snap refresh
+      register: snap_refresh
+      changed_when: "'All snaps up to date' not in snap_refresh.stdout"
+      failed_when: false
+      when:
+        - update_packages
+        - update_snap
+        - snap_detect.rc == 0
+
+    # ========================================================
+    # CLEANUP
+    # ========================================================
+
+    - name: Autoremove unused packages
+      ansible.builtin.apt:
+        autoremove: true
+        autoclean: true
+      register: cleanup_result
+      when:
+        - update_packages
+        - cleanup_packages
+
+    # ========================================================
+    # REBOOT DECISION
+    # ========================================================
+
+    - name: Check reboot-required marker
+      ansible.builtin.stat:
+        path: /var/run/reboot-required
+      register: reboot_marker
+
+    - name: Determine kernel reboot requirement
+      ansible.builtin.set_fact:
+        kernel_reboot_required: >-
+          {{
+            (newest_installed_kernel_after | default(newest_installed_kernel_before))
+            != kernel_running_before
+          }}
+
+    - name: Determine final reboot requirement
+      ansible.builtin.set_fact:
+        reboot_required: >-
+          {{
+            reboot_marker.stat.exists
+            or kernel_reboot_required
+          }}
+
+    - name: Display reboot decision
+      ansible.builtin.debug:
+        msg:
+          - "Reboot marker: {{ reboot_marker.stat.exists }}"
+          - "Kernel reboot required: {{ kernel_reboot_required }}"
+          - "Automatic reboot enabled: {{ reboot_if_required }}"
+          - "Final reboot required: {{ reboot_required }}"
+
+    # ========================================================
+    # AUTOMATIC REBOOT
+    # ========================================================
+
+    - name: Reboot host to activate updated kernel
+      ansible.builtin.reboot:
+        msg: "Ansible Enterprise Software/KERNEL update v7 - rebooting to activate latest kernel"
+        reboot_timeout: "{{ reboot_timeout }}"
+        connect_timeout: 30
+        pre_reboot_delay: 5
+        post_reboot_delay: "{{ post_reboot_delay }}"
+        test_command: "uname -r"
+      when:
+        - reboot_if_required
+        - reboot_required
+
+    # ========================================================
+    # POST-REBOOT VERIFICATION
+    # ========================================================
+
+    - name: Read running kernel after update
+      ansible.builtin.command: uname -r
+      register: kernel_after_cmd
+      changed_when: false
+
+    - name: Set running kernel after
+      ansible.builtin.set_fact:
+        kernel_running_after: "{{ kernel_after_cmd.stdout | trim }}"
+
+    - name: Fail if newest installed kernel is not running
+      ansible.builtin.fail:
+        msg: |
+          KERNEL ACTIVATION FAILED
+
+          Running before : {{ kernel_running_before }}
+          Newest installed: {{ newest_installed_kernel_after }}
+          Running after  : {{ kernel_running_after }}
+
+          The newest kernel is installed but the system did not boot it.
+          Check GRUB configuration and reboot manually.
+      when:
+        - update_kernel
+        - reboot_if_required
+        - reboot_required
+        - kernel_running_after != newest_installed_kernel_after
+
+    - name: Confirm newest kernel is active
+      ansible.builtin.debug:
+        msg: "KERNEL UPDATE SUCCESS: {{ kernel_running_after }}"
+      when:
+        - update_kernel
+        - kernel_running_after == newest_installed_kernel_after
+
+    # ========================================================
+    # FINAL HEALTH CHECKS
+    # ========================================================
+
+    - name: Final dpkg audit
+      ansible.builtin.command: dpkg --audit
+      register: dpkg_audit_after
+      changed_when: false
+      failed_when: false
+
+    - name: Final APT dependency check
+      ansible.builtin.command: apt-get check
+      register: apt_check_after
+      changed_when: false
+      failed_when: false
+
+    - name: Count remaining updates
+      ansible.builtin.shell: apt list --upgradable 2>/dev/null | tail -n +2 | wc -l
+      register: remaining_updates
+      changed_when: false
+
+    - name: Count packages after update
+      ansible.builtin.shell: dpkg-query -W -f='${binary:Package}\n' | wc -l
+      register: package_count_after
+      changed_when: false
+
+    # ========================================================
+    # JSON REPORT
+    # ========================================================
+
+    - name: Write update report
+      ansible.builtin.copy:
+        dest: "{{ report_file }}"
+        owner: root
+        group: root
+        mode: "0640"
+        content: |
+          {
+            "hostname": {{ ansible_hostname | to_json }},
+            "os": {{ ansible_distribution | to_json }},
+            "os_version": {{ ansible_distribution_version | to_json }},
+            "kernel": {
+              "track": {{ kernel_track | to_json }},
+              "running_before": {{ kernel_running_before | to_json }},
+              "newest_installed_before": {{ newest_installed_kernel_before | to_json }},
+              "candidate_image_meta": {{ kernel_image_candidate | to_json }},
+              "candidate_meta": {{ kernel_meta_candidate | to_json }},
+              "installed_meta": {{ kernel_meta_installed | to_json }},
+              "newest_installed_after": {{ newest_installed_kernel_after | to_json }},
+              "running_after": {{ kernel_running_after | to_json }},
+              "reboot_required": {{ reboot_required | lower }},
+              "kernel_reboot_required": {{ kernel_reboot_required | lower }},
+              "kernel_activation_verified": {{ (kernel_running_after == newest_installed_kernel_after) | lower }}
+            },
+            "packages": {
+              "installed_before": {{ package_count_before.stdout | trim | int }},
+              "available_updates_before": {{ package_updates_before.stdout | trim | int }},
+              "security_updates_before": {{ security_updates_before.stdout | trim | int }},
+              "installed_after": {{ package_count_after.stdout | trim | int }},
+              "remaining_updates": {{ remaining_updates.stdout | trim | int }}
+            },
+            "health": {
+              "apt_update_rc": {{ apt_health_result.rc | default(1) }},
+              "dpkg_audit_rc": {{ dpkg_audit_after.rc | default(1) }},
+              "apt_check_rc": {{ apt_check_after.rc | default(1) }}
+            },
+            "self_healing": {
+              "enabled": {{ self_heal | lower }},
+              "invalid_repository_detected": {{ invalid_release_detected | default(false) | lower }},
+              "repository_repair_attempted": {{ repository_repair is defined | lower }}
+            }
+          }
+
+    # ========================================================
+    # FINAL SUMMARY
+    # ========================================================
+
+    - name: Display final enterprise update summary
+      ansible.builtin.debug:
+        msg:
+          - "============================================================"
+          - "ENTERPRISE SOFTWARE + KERNEL UPDATE v7"
+          - "============================================================"
+          - "Host: {{ ansible_hostname }}"
+          - "OS: {{ ansible_distribution }} {{ ansible_distribution_version }}"
+          - "Kernel track: {{ kernel_track }}"
+          - "Kernel meta: {{ kernel_meta_package }}"
+          - "Kernel before: {{ kernel_running_before }}"
+          - "Newest installed before: {{ newest_installed_kernel_before }}"
+          - "APT kernel candidate: {{ kernel_image_candidate | default('NONE') }}"
+          - "Newest installed after: {{ newest_installed_kernel_after }}"
+          - "Kernel running after: {{ kernel_running_after }}"
+          - "Kernel activation verified: {{ kernel_running_after == newest_installed_kernel_after }}"
+          - "Automatic reboot: {{ reboot_if_required }}"
+          - "Reboot required: {{ reboot_required }}"
+          - "Remaining updates: {{ remaining_updates.stdout | trim }}"
+          - "DPKG audit: {{ 'PASS' if dpkg_audit_after.rc == 0 else 'FAILED' }}"
+          - "APT check: {{ 'PASS' if apt_check_after.rc == 0 else 'FAILED' }}"
+          - "Report: {{ report_file }}"
+          - "============================================================"
