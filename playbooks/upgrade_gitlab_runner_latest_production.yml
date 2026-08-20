@@ -1,0 +1,818 @@
+---
+# Production-safe GitLab Runner upgrade
+# - Detects installed version
+# - Refreshes official GitLab Runner APT repository
+# - Detects the newest package actually published by GitLab
+# - Uses APT as the primary installation method
+# - Falls back to the official GitLab Runner DEB download when APT is stale
+# - Creates a full configuration/systemd/package backup
+# - Creates an exact rollback package before changing the Runner
+# - If the old package is no longer in the APT repository, downloads it from
+#   the GitLab Runner historical DEB directory when available
+# - Validates the downloaded package before installation
+# - Restarts and verifies the Runner
+# - Automatically rolls back package + configuration if health checks fail
+#
+# Supported: Debian/Ubuntu based systems.
+
+- name: Production Safe GitLab Runner Latest Upgrade
+  hosts: all
+  become: true
+  gather_facts: true
+
+  vars:
+    runner_package: gitlab-runner
+    helper_package: gitlab-runner-helper-images
+    runner_service: gitlab-runner
+
+    repo_script_url: "https://packages.gitlab.com/install/repositories/runner/gitlab-runner/script.deb.sh"
+    repo_script_path: "/tmp/gitlab-runner-repo.sh"
+
+    latest_index_url: "https://s3.dualstack.us-east-1.amazonaws.com/gitlab-runner-downloads/latest/index.html"
+    latest_deb_base: "https://s3.dualstack.us-east-1.amazonaws.com/gitlab-runner-downloads/latest/deb"
+    historical_deb_base: "https://s3.dualstack.us-east-1.amazonaws.com/gitlab-runner-downloads/v{{ installed_runner_version }}/deb"
+
+    backup_root: "/var/backups/gitlab-runner"
+    apt_timeout: 180
+    health_retries: 12
+    health_delay: 5
+
+  pre_tasks:
+    - name: Verify supported OS family
+      ansible.builtin.assert:
+        that:
+          - ansible_os_family == "Debian"
+        fail_msg: "This playbook supports Debian/Ubuntu systems only."
+
+    - name: Check required commands
+      ansible.builtin.shell:
+        cmd: "command -v {{ item }}"
+      loop:
+        - apt-get
+        - apt-cache
+        - dpkg
+        - dpkg-deb
+        - systemctl
+        - gitlab-runner
+      register: required_commands
+      changed_when: false
+      failed_when: false
+
+    - name: Verify GitLab Runner exists
+      ansible.builtin.command:
+        cmd: gitlab-runner --version
+      register: runner_version_raw
+      changed_when: false
+      failed_when: runner_version_raw.rc != 0
+
+    - name: Extract installed Runner semantic version
+      ansible.builtin.set_fact:
+        installed_runner_version: >-
+          {{
+            (
+              runner_version_raw.stdout
+              | regex_search('Version:\s*([0-9]+\.[0-9]+\.[0-9]+)', '\1')
+              | first
+              | default('')
+            ) | trim
+          }}
+
+    - name: Read installed Runner package version
+      ansible.builtin.command:
+        cmd: "dpkg-query -W -f=${Version} {{ runner_package }}"
+      register: installed_package_raw
+      changed_when: false
+
+    - name: Set installed package version
+      ansible.builtin.set_fact:
+        installed_package_version: "{{ installed_package_raw.stdout | trim }}"
+
+    - name: Read Debian architecture
+      ansible.builtin.command:
+        cmd: dpkg --print-architecture
+      register: architecture_raw
+      changed_when: false
+
+    - name: Set Runner architecture
+      ansible.builtin.set_fact:
+        runner_arch: "{{ architecture_raw.stdout | trim }}"
+
+    - name: Validate installed version
+      ansible.builtin.assert:
+        that:
+          - installed_runner_version | length > 0
+          - installed_package_version | length > 0
+        fail_msg: "Could not reliably determine the installed GitLab Runner version."
+
+    - name: Display current Runner state
+      ansible.builtin.debug:
+        msg:
+          - "=============================================="
+          - "GITLAB RUNNER CURRENT STATE"
+          - "=============================================="
+          - "Host              : {{ inventory_hostname }}"
+          - "Binary version    : {{ installed_runner_version }}"
+          - "Package version   : {{ installed_package_version }}"
+          - "Architecture      : {{ runner_arch }}"
+          - "=============================================="
+
+  tasks:
+    # ------------------------------------------------------------------
+    # Official repository
+    # ------------------------------------------------------------------
+    - name: Detect GitLab Runner official APT repository
+      ansible.builtin.shell:
+        cmd: |
+          grep -RhsE 'packages\.gitlab\.com.*runner/gitlab-runner' \
+            /etc/apt/sources.list /etc/apt/sources.list.d/ 2>/dev/null || true
+      register: repo_detect
+      changed_when: false
+
+    - name: Download official repository installer
+      ansible.builtin.get_url:
+        url: "{{ repo_script_url }}"
+        dest: "{{ repo_script_path }}"
+        mode: "0755"
+        timeout: 60
+        validate_certs: true
+      when: repo_detect.stdout | trim == ""
+
+    - name: Install official GitLab Runner repository
+      ansible.builtin.command:
+        cmd: "bash {{ repo_script_path }}"
+      when: repo_detect.stdout | trim == ""
+
+    - name: Remove repository installer
+      ansible.builtin.file:
+        path: "{{ repo_script_path }}"
+        state: absent
+
+    # ------------------------------------------------------------------
+    # APT metadata and vendor version detection
+    # ------------------------------------------------------------------
+    - name: Refresh APT metadata
+      ansible.builtin.apt:
+        update_cache: true
+        cache_valid_time: 0
+      environment:
+        DEBIAN_FRONTEND: noninteractive
+
+    - name: Get GitLab Runner APT candidate
+      ansible.builtin.shell:
+        cmd: "apt-cache policy {{ runner_package }} | awk '/Candidate:/ {print $2}'"
+      register: apt_candidate_raw
+      changed_when: false
+
+    - name: Get all GitLab Runner APT versions
+      ansible.builtin.shell:
+        cmd: "apt-cache madison {{ runner_package }} | awk '{print $3}' | sort -Vu"
+      register: apt_versions_raw
+      changed_when: false
+
+    - name: Set APT candidate
+      ansible.builtin.set_fact:
+        apt_candidate_version: "{{ apt_candidate_raw.stdout | trim }}"
+
+    - name: Determine whether APT has a newer package
+      ansible.builtin.set_fact:
+        apt_has_newer: >-
+          {{
+            apt_candidate_version not in ['', 'none', '(none)']
+            and apt_candidate_version is version(installed_package_version, '>')
+          }}
+
+    # ------------------------------------------------------------------
+    # Official latest release detection
+    # ------------------------------------------------------------------
+    - name: Query official GitLab Runner latest index
+      ansible.builtin.uri:
+        url: "{{ latest_index_url }}"
+        method: GET
+        return_content: true
+        status_code: 200
+        timeout: 60
+        validate_certs: true
+      register: latest_index
+      changed_when: false
+      failed_when: false
+
+    - name: Validate official latest index
+      ansible.builtin.assert:
+        that:
+          - latest_index.status == 200
+          - latest_index.content | length > 0
+        fail_msg:
+          - "Could not access the official GitLab Runner latest release index."
+          - "URL: {{ latest_index_url }}"
+          - "No upgrade will be attempted."
+
+    - name: Extract official latest semantic version
+      ansible.builtin.set_fact:
+        official_latest_version: >-
+          {{
+            (
+              latest_index.content
+              | regex_search('<title>\s*GitLab Runner\s*::\s*([0-9]+\.[0-9]+\.[0-9]+)', '\1')
+              | first
+              | default('')
+            ) | trim
+          }}
+
+    - name: Validate official latest version
+      ansible.builtin.assert:
+        that:
+          - official_latest_version | length > 0
+        fail_msg:
+          - "The official GitLab Runner page was reachable but its version format could not be parsed."
+          - "Vendor page format may have changed."
+          - "No upgrade will be attempted."
+
+    - name: Determine whether official release is newer
+      ansible.builtin.set_fact:
+        official_has_newer: >-
+          {{ official_latest_version is version(installed_runner_version, '>') }}
+
+    - name: Determine upgrade requirement
+      ansible.builtin.set_fact:
+        upgrade_required: "{{ apt_has_newer or official_has_newer }}"
+
+    - name: Select target version
+      ansible.builtin.set_fact:
+        target_runner_version: "{{ official_latest_version if official_has_newer else apt_candidate_version }}"
+
+    - name: Display vendor version decision
+      ansible.builtin.debug:
+        msg:
+          - "=============================================="
+          - "GITLAB RUNNER VENDOR VERSION CHECK"
+          - "=============================================="
+          - "Installed binary : {{ installed_runner_version }}"
+          - "Installed package: {{ installed_package_version }}"
+          - "APT candidate    : {{ apt_candidate_version }}"
+          - "Official latest  : {{ official_latest_version }}"
+          - "APT newer        : {{ apt_has_newer }}"
+          - "Official newer   : {{ official_has_newer }}"
+          - "Upgrade required : {{ upgrade_required }}"
+          - "Target version   : {{ target_runner_version }}"
+          - "=============================================="
+
+    - name: Report current version is latest
+      ansible.builtin.debug:
+        msg:
+          - "NO UPGRADE REQUIRED."
+          - "Installed Runner : {{ installed_runner_version }}"
+          - "Official latest  : {{ official_latest_version }}"
+          - "No system changes will be made."
+      when: not upgrade_required
+
+    - name: End host when latest
+      ansible.builtin.meta: end_host
+      when: not upgrade_required
+
+    # ------------------------------------------------------------------
+    # Backup
+    # ------------------------------------------------------------------
+    - name: Create backup timestamp
+      ansible.builtin.set_fact:
+        backup_timestamp: "{{ ansible_date_time.iso8601_basic_short }}"
+
+    - name: Set backup directory
+      ansible.builtin.set_fact:
+        backup_dir: "{{ backup_root }}/{{ backup_timestamp }}"
+
+    - name: Create backup directory
+      ansible.builtin.file:
+        path: "{{ backup_dir }}"
+        state: directory
+        owner: root
+        group: root
+        mode: "0700"
+
+    - name: Backup Runner configuration directory
+      ansible.builtin.archive:
+        path: /etc/gitlab-runner
+        dest: "{{ backup_dir }}/gitlab-runner-config.tar.gz"
+        format: gz
+        owner: root
+        group: root
+        mode: "0600"
+
+    - name: Check default Runner configuration
+      ansible.builtin.stat:
+        path: /etc/default/gitlab-runner
+      register: default_runner_stat
+
+    - name: Backup default Runner configuration
+      ansible.builtin.copy:
+        src: /etc/default/gitlab-runner
+        dest: "{{ backup_dir }}/gitlab-runner-default"
+        remote_src: true
+        owner: root
+        group: root
+        mode: "0600"
+      when: default_runner_stat.stat.exists
+
+    - name: Backup systemd unit
+      ansible.builtin.shell:
+        cmd: "systemctl cat {{ runner_service }} > {{ backup_dir }}/systemd-before.txt 2>&1"
+      changed_when: false
+
+    - name: Backup package metadata
+      ansible.builtin.shell:
+        cmd: |
+          dpkg-query -W -f='Package=${Package}\nVersion=${Version}\nArchitecture=${Architecture}\nStatus=${Status}\n' \
+          {{ runner_package }} > {{ backup_dir }}/package-before.txt
+      changed_when: false
+
+    - name: Backup helper package metadata
+      ansible.builtin.shell:
+        cmd: |
+          dpkg-query -W -f='Package=${Package}\nVersion=${Version}\nArchitecture=${Architecture}\nStatus=${Status}\n' \
+          {{ helper_package }} > {{ backup_dir }}/helper-before.txt
+      changed_when: false
+      failed_when: false
+
+    - name: Backup Runner version and decision
+      ansible.builtin.copy:
+        dest: "{{ backup_dir }}/upgrade-context.txt"
+        owner: root
+        group: root
+        mode: "0600"
+        content: |
+          Host: {{ inventory_hostname }}
+          Date: {{ ansible_date_time.iso8601 }}
+          Installed binary: {{ installed_runner_version }}
+          Installed package: {{ installed_package_version }}
+          APT candidate: {{ apt_candidate_version }}
+          Official latest: {{ official_latest_version }}
+          Target: {{ target_runner_version }}
+          Architecture: {{ runner_arch }}
+
+    # ------------------------------------------------------------------
+    # Exact rollback package
+    #
+    # First try:
+    # 1. APT download of exact old version.
+    # 2. Local APT cache.
+    # 3. Official historical GitLab Runner download path.
+    #
+    # Only after exact package verification does the upgrade proceed.
+    # ------------------------------------------------------------------
+    - name: Try to download exact old Runner package from APT
+      ansible.builtin.command:
+        cmd: "apt-get download {{ runner_package }}={{ installed_package_version }}"
+      args:
+        chdir: "{{ backup_dir }}"
+      register: old_runner_apt_download
+      changed_when: true
+      failed_when: false
+
+    - name: Find old Runner package downloaded from APT
+      ansible.builtin.find:
+        paths: "{{ backup_dir }}"
+        patterns:
+          - "gitlab-runner_*.deb"
+        file_type: file
+      register: old_runner_downloaded
+
+    - name: Search local APT cache for old Runner package
+      ansible.builtin.find:
+        paths:
+          - /var/cache/apt/archives
+          - /var/cache/apt/archives/partial
+        patterns:
+          - "gitlab-runner_*.deb"
+        file_type: file
+      register: old_runner_cached
+
+    - name: Set rollback package candidate
+      ansible.builtin.set_fact:
+        rollback_candidate: >-
+          {{
+            (
+              old_runner_downloaded.files
+              | map(attribute='path')
+              | list
+              | first
+            )
+            | default(
+                (
+                  old_runner_cached.files
+                  | map(attribute='path')
+                  | list
+                  | first
+                ),
+                true
+              )
+            | default('', true)
+          }}
+
+    - name: Copy cached old Runner package
+      ansible.builtin.copy:
+        src: "{{ rollback_candidate }}"
+        dest: "{{ backup_dir }}/{{ rollback_candidate | basename }}"
+        remote_src: true
+        owner: root
+        group: root
+        mode: "0600"
+      when:
+        - rollback_candidate | length > 0
+        - old_runner_downloaded.files | length == 0
+
+    # ------------------------------------------------------------------
+    # Historical fallback
+    # GitLab's manual-install docs document versioned/latest S3 DEB
+    # downloads. Use the exact installed semantic version here.
+    # ------------------------------------------------------------------
+    - name: Set historical rollback package URL
+      ansible.builtin.set_fact:
+        historical_runner_url: "{{ historical_deb_base }}/gitlab-runner_{{ runner_arch }}.deb"
+
+    - name: Download exact historical Runner package
+      ansible.builtin.get_url:
+        url: "{{ historical_runner_url }}"
+        dest: "{{ backup_dir }}/gitlab-runner-rollback-{{ installed_runner_version }}-{{ runner_arch }}.deb"
+        mode: "0600"
+        timeout: "{{ apt_timeout }}"
+        validate_certs: true
+      register: historical_download
+      when: rollback_candidate | length == 0
+      failed_when: false
+
+    - name: Set historical rollback path
+      ansible.builtin.set_fact:
+        historical_rollback_path: "{{ backup_dir }}/gitlab-runner-rollback-{{ installed_runner_version }}-{{ runner_arch }}.deb"
+
+    - name: Find all rollback Runner packages
+      ansible.builtin.find:
+        paths: "{{ backup_dir }}"
+        patterns:
+          - "gitlab-runner_*.deb"
+          - "gitlab-runner-rollback-*.deb"
+        file_type: file
+      register: rollback_packages
+
+    - name: Validate exact rollback package exists
+      ansible.builtin.assert:
+        that:
+          - rollback_packages.files | length > 0
+        fail_msg:
+          - "UPGRADE ABORTED SAFELY."
+          - "No exact rollback package for {{ installed_package_version }} could be obtained."
+          - "The current Runner was NOT modified."
+          - "Backup directory: {{ backup_dir }}"
+          - "APT repository may have removed the old release and the historical vendor URL was unavailable."
+
+    - name: Find rollback package with exact installed semantic version
+      ansible.builtin.shell:
+        cmd: |
+          for f in {{ backup_dir }}/gitlab-runner*.deb; do
+            [ -f "$f" ] || continue
+            v="$(dpkg-deb -f "$f" Version 2>/dev/null || true)"
+            if [ "$v" = "{{ installed_package_version }}" ]; then
+              printf '%s\n' "$f"
+              exit 0
+            fi
+          done
+          exit 1
+      register: exact_rollback_package
+      changed_when: false
+      failed_when: false
+
+    - name: Abort unless exact rollback package matches installed package
+      ansible.builtin.assert:
+        that:
+          - exact_rollback_package.rc == 0
+          - exact_rollback_package.stdout | trim | length > 0
+        fail_msg:
+          - "UPGRADE ABORTED SAFELY."
+          - "A rollback .deb was found, but its package version does not exactly match {{ installed_package_version }}."
+          - "No production upgrade was performed."
+          - "Backup directory: {{ backup_dir }}"
+
+    - name: Set exact rollback package
+      ansible.builtin.set_fact:
+        rollback_package_path: "{{ exact_rollback_package.stdout | trim }}"
+
+    # ------------------------------------------------------------------
+    # Pre-upgrade Runner health
+    # ------------------------------------------------------------------
+    - name: Verify Runner before upgrade
+      ansible.builtin.command:
+        cmd: gitlab-runner verify
+      register: verify_before
+      changed_when: false
+      failed_when: false
+
+    - name: Save pre-upgrade verification
+      ansible.builtin.copy:
+        dest: "{{ backup_dir }}/verify-before.txt"
+        owner: root
+        group: root
+        mode: "0600"
+        content: |
+          Return code: {{ verify_before.rc }}
+          STDOUT:
+          {{ verify_before.stdout }}
+          STDERR:
+          {{ verify_before.stderr }}
+
+    # ------------------------------------------------------------------
+    # Upgrade
+    # ------------------------------------------------------------------
+    - name: Upgrade Runner to latest APT vendor package
+      ansible.builtin.apt:
+        name: "{{ runner_package }}"
+        state: latest
+        update_cache: true
+        force_apt_get: true
+      environment:
+        DEBIAN_FRONTEND: noninteractive
+        NO_DOCKER_PRUNE: "1"
+      register: apt_upgrade_result
+      when: apt_has_newer
+
+    - name: Create latest DEB staging directory
+      ansible.builtin.file:
+        path: "{{ backup_dir }}/latest"
+        state: directory
+        owner: root
+        group: root
+        mode: "0700"
+      when: not apt_has_newer and official_has_newer
+
+    - name: Download latest official Runner DEB
+      ansible.builtin.get_url:
+        url: "{{ latest_deb_base }}/gitlab-runner_{{ runner_arch }}.deb"
+        dest: "{{ backup_dir }}/latest/gitlab-runner_{{ runner_arch }}.deb"
+        owner: root
+        group: root
+        mode: "0600"
+        timeout: "{{ apt_timeout }}"
+        validate_certs: true
+      when: not apt_has_newer and official_has_newer
+
+    - name: Download latest official helper package
+      ansible.builtin.get_url:
+        url: "{{ latest_deb_base }}/gitlab-runner-helper-images.deb"
+        dest: "{{ backup_dir }}/latest/gitlab-runner-helper-images.deb"
+        owner: root
+        group: root
+        mode: "0600"
+        timeout: "{{ apt_timeout }}"
+        validate_certs: true
+      when: not apt_has_newer and official_has_newer
+
+    - name: Read actual latest Runner DEB version
+      ansible.builtin.command:
+        cmd: "dpkg-deb -f {{ backup_dir }}/latest/gitlab-runner_{{ runner_arch }}.deb Version"
+      register: latest_deb_version
+      changed_when: false
+      when: not apt_has_newer and official_has_newer
+
+    - name: Validate actual latest Runner DEB
+      ansible.builtin.assert:
+        that:
+          - latest_deb_version.stdout | trim is version(installed_package_version, '>')
+          - latest_deb_version.stdout | trim is version(target_runner_version ~ '-999999', '<=')
+        fail_msg:
+          - "Latest downloaded Runner DEB failed version validation."
+          - "Installed: {{ installed_package_version }}"
+          - "Target: {{ target_runner_version }}"
+          - "Downloaded: {{ latest_deb_version.stdout | trim }}"
+      when: not apt_has_newer and official_has_newer
+
+    - name: Install latest official Runner DEB
+      ansible.builtin.apt:
+        deb: "{{ backup_dir }}/latest/gitlab-runner_{{ runner_arch }}.deb"
+        force_apt_get: true
+      environment:
+        DEBIAN_FRONTEND: noninteractive
+      when: not apt_has_newer and official_has_newer
+
+    - name: Install latest official helper package
+      ansible.builtin.apt:
+        deb: "{{ backup_dir }}/latest/gitlab-runner-helper-images.deb"
+        force_apt_get: true
+      environment:
+        DEBIAN_FRONTEND: noninteractive
+      when: not apt_has_newer and official_has_newer
+
+    # ------------------------------------------------------------------
+    # Health checks
+    # ------------------------------------------------------------------
+    - name: Reload systemd
+      ansible.builtin.systemd:
+        daemon_reload: true
+
+    - name: Restart GitLab Runner
+      ansible.builtin.systemd:
+        name: "{{ runner_service }}"
+        state: restarted
+        enabled: true
+
+    - name: Wait for Runner service to become active
+      ansible.builtin.command:
+        cmd: "systemctl is-active {{ runner_service }}"
+      register: service_health
+      retries: "{{ health_retries }}"
+      delay: "{{ health_delay }}"
+      until: service_health.rc == 0
+      changed_when: false
+      failed_when: false
+
+    - name: Get Runner version after upgrade
+      ansible.builtin.command:
+        cmd: gitlab-runner --version
+      register: runner_after
+      changed_when: false
+      failed_when: false
+
+    - name: Extract upgraded Runner version
+      ansible.builtin.set_fact:
+        upgraded_runner_version: >-
+          {{
+            (
+              runner_after.stdout
+              | regex_search('Version:\s*([0-9]+\.[0-9]+\.[0-9]+)', '\1')
+              | first
+              | default('')
+            ) | trim
+          }}
+
+    - name: Verify Runner after upgrade
+      ansible.builtin.command:
+        cmd: gitlab-runner verify
+      register: verify_after
+      changed_when: false
+      failed_when: false
+
+    - name: Read final package version
+      ansible.builtin.command:
+        cmd: "dpkg-query -W -f=${Version} {{ runner_package }}"
+      register: final_package_raw
+      changed_when: false
+      failed_when: false
+
+    - name: Set final package version
+      ansible.builtin.set_fact:
+        final_package_version: "{{ final_package_raw.stdout | trim }}"
+
+    - name: Determine final Runner health
+      ansible.builtin.set_fact:
+        runner_healthy: >-
+          {{
+            service_health.rc == 0
+            and runner_after.rc == 0
+            and verify_after.rc == 0
+            and upgraded_runner_version | length > 0
+            and upgraded_runner_version is version(installed_runner_version, '>')
+            and final_package_version is version(installed_package_version, '>')
+          }}
+
+    - name: Save post-upgrade health
+      ansible.builtin.copy:
+        dest: "{{ backup_dir }}/health-after.txt"
+        owner: root
+        group: root
+        mode: "0600"
+        content: |
+          Binary version:
+          {{ runner_after.stdout }}
+          Package version:
+          {{ final_package_version }}
+          Service:
+          {{ service_health.stdout }}
+          Verify RC:
+          {{ verify_after.rc }}
+          Verify STDOUT:
+          {{ verify_after.stdout }}
+          Verify STDERR:
+          {{ verify_after.stderr }}
+          Healthy:
+          {{ runner_healthy }}
+
+    # ------------------------------------------------------------------
+    # Automatic rollback
+    # ------------------------------------------------------------------
+    - name: Stop Runner before rollback
+      ansible.builtin.systemd:
+        name: "{{ runner_service }}"
+        state: stopped
+      when: not runner_healthy
+
+    - name: Restore exact previous Runner package
+      ansible.builtin.apt:
+        deb: "{{ rollback_package_path }}"
+        force_apt_get: true
+      environment:
+        DEBIAN_FRONTEND: noninteractive
+      when: not runner_healthy
+
+    - name: Restore Runner configuration
+      ansible.builtin.unarchive:
+        src: "{{ backup_dir }}/gitlab-runner-config.tar.gz"
+        dest: /
+        remote_src: true
+      when: not runner_healthy
+
+    - name: Restore default Runner configuration
+      ansible.builtin.copy:
+        src: "{{ backup_dir }}/gitlab-runner-default"
+        dest: /etc/default/gitlab-runner
+        remote_src: true
+        owner: root
+        group: root
+        mode: "0644"
+      when:
+        - not runner_healthy
+        - default_runner_stat.stat.exists
+
+    - name: Reload systemd after rollback
+      ansible.builtin.systemd:
+        daemon_reload: true
+      when: not runner_healthy
+
+    - name: Start Runner after rollback
+      ansible.builtin.systemd:
+        name: "{{ runner_service }}"
+        state: started
+        enabled: true
+      when: not runner_healthy
+
+    - name: Check rollback service
+      ansible.builtin.command:
+        cmd: "systemctl is-active {{ runner_service }}"
+      register: rollback_service
+      changed_when: false
+      failed_when: false
+      when: not runner_healthy
+
+    - name: Check rollback version
+      ansible.builtin.command:
+        cmd: gitlab-runner --version
+      register: rollback_version
+      changed_when: false
+      failed_when: false
+      when: not runner_healthy
+
+    - name: Check rollback Runner verification
+      ansible.builtin.command:
+        cmd: gitlab-runner verify
+      register: rollback_verify
+      changed_when: false
+      failed_when: false
+      when: not runner_healthy
+
+    - name: Write rollback report
+      ansible.builtin.copy:
+        dest: "{{ backup_dir }}/ROLLBACK-REPORT.txt"
+        owner: root
+        group: root
+        mode: "0600"
+        content: |
+          ==============================================
+          AUTOMATIC GITLAB RUNNER ROLLBACK
+          ==============================================
+          Host: {{ inventory_hostname }}
+          Previous package: {{ installed_package_version }}
+          Attempted target: {{ target_runner_version }}
+
+          Runner after rollback:
+          {{ rollback_version.stdout | default('UNKNOWN') }}
+
+          Service:
+          {{ rollback_service.stdout | default('UNKNOWN') }}
+
+          Verify return code:
+          {{ rollback_verify.rc | default('UNKNOWN') }}
+
+          Backup:
+          {{ backup_dir }}
+
+    - name: Fail because upgrade health checks failed
+      ansible.builtin.fail:
+        msg:
+          - "GITLAB RUNNER UPGRADE FAILED."
+          - "Automatic rollback was attempted."
+          - "Previous package: {{ installed_package_version }}"
+          - "Target package: {{ target_runner_version }}"
+          - "Backup: {{ backup_dir }}"
+          - "Check ROLLBACK-REPORT.txt."
+      when: not runner_healthy
+
+    - name: Final success report
+      ansible.builtin.debug:
+        msg:
+          - "=============================================="
+          - "GITLAB RUNNER UPGRADE SUCCESSFUL"
+          - "=============================================="
+          - "Host              : {{ inventory_hostname }}"
+          - "Previous version  : {{ installed_runner_version }}"
+          - "New version       : {{ upgraded_runner_version }}"
+          - "Final package     : {{ final_package_version }}"
+          - "Service           : {{ service_health.stdout | trim }}"
+          - "Runner verify RC  : {{ verify_after.rc }}"
+          - "Backup directory  : {{ backup_dir }}"
+          - "=============================================="
+      when: runner_healthy
