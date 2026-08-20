@@ -1,0 +1,990 @@
+---
+- name: Enterprise Linux Software and Kernel Lifecycle v9
+  hosts: all
+  become: true
+  gather_facts: true
+  serial: 1
+
+  vars:
+    update_packages: true
+    update_kernel: true
+    update_snap: true
+    reboot_if_required: true
+    self_heal: true
+    disable_invalid_repositories: true
+    cleanup_packages: true
+    reboot_timeout: 900
+    post_reboot_delay: 30
+    report_directory: /var/log/ansible-software-update
+    report_file: /var/log/ansible-software-update/software-update-report.json
+    excluded_packages: []
+
+  pre_tasks:
+    - name: Validate operating system
+      ansible.builtin.assert:
+        that:
+          - ansible_distribution in ['Ubuntu', 'Debian']
+        fail_msg: "Unsupported operating system: {{ ansible_distribution }}"
+
+    - name: Create report directory
+      ansible.builtin.file:
+        path: "{{ report_directory }}"
+        state: directory
+        owner: root
+        group: root
+        mode: "0750"
+
+    - name: Capture running kernel before update
+      ansible.builtin.command: uname -r
+      register: kernel_before_cmd
+      changed_when: false
+
+    - name: Set running kernel before update
+      ansible.builtin.set_fact:
+        kernel_running_before: "{{ kernel_before_cmd.stdout | trim }}"
+
+  tasks:
+    - name: Check dpkg audit state
+      ansible.builtin.command: dpkg --audit
+      register: dpkg_audit_before
+      changed_when: false
+      failed_when: false
+
+    - name: Repair interrupted dpkg configuration
+      ansible.builtin.command: dpkg --configure -a
+      register: dpkg_repair
+      changed_when: true
+      failed_when: false
+      when:
+        - self_heal
+        - dpkg_audit_before.stdout | trim | length > 0
+
+    - name: Repair broken dependencies
+      ansible.builtin.command: apt-get -f install -y
+      register: dependency_repair
+      changed_when: true
+      failed_when: false
+      when: self_heal
+
+    - name: Run initial APT update
+      ansible.builtin.command: apt-get update
+      register: apt_update_first
+      changed_when: false
+      failed_when: false
+
+    - name: Build APT diagnostic text
+      ansible.builtin.set_fact:
+        apt_error_text: "{{ (apt_update_first.stdout | default('')) ~ '\n' ~ (apt_update_first.stderr | default('')) }}"
+
+    - name: Detect APT repository failure
+      ansible.builtin.set_fact:
+        invalid_release_detected: >-
+          {{
+            apt_error_text is search('does not have a Release file')
+            or apt_error_text is search('404 Not Found')
+            or apt_error_text is search('404  Not Found')
+          }}
+
+    - name: Extract failed repository URIs
+      ansible.builtin.set_fact:
+        failed_repo_uris: >-
+          {{
+            apt_error_text
+            | regex_findall("https?://[^'[:space:]]+")
+            | map('regex_replace', '[),;]+$', '')
+            | unique
+            | list
+          }}
+      when: invalid_release_detected
+
+    - name: Filter official repositories out
+      ansible.builtin.set_fact:
+        candidate_failed_repo_uris: >-
+          {{
+            failed_repo_uris | default([])
+            | reject('search', 'archive\.ubuntu\.com')
+            | reject('search', 'security\.ubuntu\.com')
+            | reject('search', 'ports\.ubuntu\.com')
+            | reject('search', 'old-releases\.ubuntu\.com')
+            | reject('search', 'archive\.debian\.org')
+            | reject('search', 'security\.debian\.org')
+            | list
+          }}
+      when: invalid_release_detected
+
+    - name: Find source files containing failed repository URI
+      ansible.builtin.shell: |
+        set -o pipefail
+        while IFS= read -r uri; do
+          [ -n "$uri" ] || continue
+          grep -RIlF --include='*.list' --include='*.sources' -- "$uri" /etc/apt/sources.list.d 2>/dev/null || true
+        done <<< "{{ candidate_failed_repo_uris | default([]) | join('\n') }}"
+      args:
+        executable: /bin/bash
+      register: failed_repo_source_files
+      changed_when: false
+      failed_when: false
+      when:
+        - invalid_release_detected
+        - candidate_failed_repo_uris | default([]) | length > 0
+
+    - name: Disable exact broken repository source files
+      ansible.builtin.shell: |
+        set -e
+        backup="/etc/apt/sources.list.d/ansible-disabled"
+        mkdir -p "$backup"
+        while IFS= read -r f; do
+          [ -n "$f" ] || continue
+          [ -f "$f" ] || continue
+          cp -a "$f" "$backup/$(basename "$f").$(date +%Y%m%d%H%M%S).bak"
+          case "$f" in
+            *.list)
+              sed -i -E 's/^[[:space:]]*(deb(-src)?[[:space:]])/# disabled-by-ansible: \1/' "$f"
+              ;;
+            *.sources)
+              if grep -qE '^Enabled:' "$f"; then
+                sed -i -E 's/^Enabled:.*/Enabled: no/' "$f"
+              else
+                printf '%s\n' 'Enabled: no' >> "$f"
+              fi
+              ;;
+          esac
+          printf '%s\n' "Disabled broken repository source: $f"
+        done <<< "{{ failed_repo_source_files.stdout | default('') }}"
+      args:
+        executable: /bin/bash
+      register: repository_repair
+      changed_when: repository_repair.stdout | trim | length > 0
+      failed_when: false
+      when:
+        - self_heal
+        - disable_invalid_repositories
+        - invalid_release_detected
+        - failed_repo_source_files.stdout | default('') | trim | length > 0
+
+    - name: Retry APT update after repository repair
+      ansible.builtin.command: apt-get update
+      register: apt_update_final
+      changed_when: false
+      failed_when: false
+      when: invalid_release_detected
+
+    - name: Select final APT health result
+      ansible.builtin.set_fact:
+        apt_health_result: "{{ apt_update_final if invalid_release_detected else apt_update_first }}"
+
+    - name: Fail if APT remains unhealthy
+      ansible.builtin.fail:
+        msg: |
+          APT remains unhealthy after self-healing.
+          RC: {{ apt_health_result.rc | default(1) }}
+          STDOUT:
+          {{ apt_health_result.stdout | default('') }}
+          STDERR:
+          {{ apt_health_result.stderr | default('') }}
+      when: apt_health_result.rc | default(1) != 0
+
+    - name: Count installed packages before
+      ansible.builtin.shell: dpkg-query -W -f='${binary:Package}\n' | wc -l
+      register: package_count_before
+      changed_when: false
+
+    - name: Count available updates
+      ansible.builtin.shell: apt list --upgradable 2>/dev/null | tail -n +2 | wc -l
+      register: package_updates_before
+      changed_when: false
+
+    - name: Detect installed Ubuntu HWE meta package
+      ansible.builtin.shell: |
+        dpkg-query -W -f='${Status}' "linux-generic-hwe-{{ ansible_distribution_version }}" 2>/dev/null |
+        grep -q 'install ok installed'
+      register: hwe_meta_installed
+      changed_when: false
+      failed_when: false
+      when: ansible_distribution == 'Ubuntu'
+
+    - name: Determine kernel track
+      ansible.builtin.set_fact:
+        kernel_track: "{{ 'hwe' if hwe_meta_installed.rc | default(1) == 0 else 'generic' }}"
+      when: ansible_distribution == 'Ubuntu'
+
+    - name: Set Debian kernel track
+      ansible.builtin.set_fact:
+        kernel_track: debian
+      when: ansible_distribution == 'Debian'
+
+    - name: Set Ubuntu HWE kernel packages
+      ansible.builtin.set_fact:
+        kernel_meta_package: "linux-generic-hwe-{{ ansible_distribution_version }}"
+        kernel_image_meta_package: "linux-image-generic-hwe-{{ ansible_distribution_version }}"
+        kernel_headers_meta_package: "linux-headers-generic-hwe-{{ ansible_distribution_version }}"
+      when:
+        - ansible_distribution == 'Ubuntu'
+        - kernel_track == 'hwe'
+
+    - name: Set Ubuntu Generic kernel packages
+      ansible.builtin.set_fact:
+        kernel_meta_package: linux-generic
+        kernel_image_meta_package: linux-image-generic
+        kernel_headers_meta_package: linux-headers-generic
+      when:
+        - ansible_distribution == 'Ubuntu'
+        - kernel_track == 'generic'
+
+    - name: Set Debian kernel packages
+      ansible.builtin.set_fact:
+        kernel_meta_package: linux-image-amd64
+        kernel_image_meta_package: linux-image-amd64
+        kernel_headers_meta_package: linux-headers-amd64
+      when: ansible_distribution == 'Debian'
+
+    - name: Discover installed kernels before
+      ansible.builtin.shell: |
+        find /boot -maxdepth 1 -type f -name 'vmlinuz-*' -printf '%f\n' |
+        sed 's/^vmlinuz-//' |
+        sort -V
+      register: installed_kernels_before_cmd
+      changed_when: false
+      failed_when: false
+
+    - name: Set newest installed kernel before
+      ansible.builtin.set_fact:
+        newest_installed_kernel_before: >-
+          {{
+            installed_kernels_before_cmd.stdout_lines[-1]
+            if installed_kernels_before_cmd.stdout_lines | length > 0
+            else ''
+          }}
+
+    - name: Query kernel meta candidate
+      ansible.builtin.shell: |
+        apt-cache policy "{{ kernel_meta_package }}" |
+        awk '/Candidate:/ {print $2; exit}'
+      register: kernel_meta_candidate_cmd
+      changed_when: false
+      failed_when: false
+
+    - name: Query installed kernel meta version
+      ansible.builtin.shell: |
+        dpkg-query -W -f='${Version}' "{{ kernel_meta_package }}" 2>/dev/null || true
+      register: kernel_meta_installed_cmd
+      changed_when: false
+      failed_when: false
+
+    - name: Set kernel candidate facts
+      ansible.builtin.set_fact:
+        kernel_meta_candidate: "{{ kernel_meta_candidate_cmd.stdout | trim }}"
+        kernel_meta_installed: "{{ kernel_meta_installed_cmd.stdout | trim }}"
+
+    - name: Determine kernel meta update requirement
+      ansible.builtin.shell: |
+        installed="{{ kernel_meta_installed }}"
+        candidate="{{ kernel_meta_candidate }}"
+        if [ -z "$candidate" ] || [ "$candidate" = "(none)" ]; then
+          echo unknown
+        elif [ -z "$installed" ]; then
+          echo yes
+        elif dpkg --compare-versions "$candidate" gt "$installed"; then
+          echo yes
+        else
+          echo no
+        fi
+      register: kernel_update_needed_cmd
+      changed_when: false
+
+    - name: Set kernel update requirement
+      ansible.builtin.set_fact:
+        kernel_update_needed: "{{ kernel_update_needed_cmd.stdout | trim }}"
+
+    - name: Install latest kernel for existing track
+      ansible.builtin.apt:
+        name:
+          - "{{ kernel_meta_package }}"
+          - "{{ kernel_image_meta_package }}"
+          - "{{ kernel_headers_meta_package }}"
+        state: latest
+        install_recommends: true
+        update_cache: false
+      register: kernel_install_result
+      when:
+        - update_packages
+        - update_kernel
+        - kernel_update_needed in ['yes', 'unknown']
+
+    - name: Ensure current-track kernel meta packages are present
+      ansible.builtin.apt:
+        name:
+          - "{{ kernel_meta_package }}"
+          - "{{ kernel_image_meta_package }}"
+          - "{{ kernel_headers_meta_package }}"
+        state: present
+        install_recommends: true
+        update_cache: false
+      register: kernel_present_result
+      when:
+        - update_packages
+        - update_kernel
+
+    - name: Repair dependencies after kernel update
+      ansible.builtin.command: apt-get -f install -y
+      register: kernel_dependency_repair
+      changed_when: true
+      failed_when: false
+      when:
+        - update_packages
+        - update_kernel
+
+    - name: Rebuild initramfs
+      ansible.builtin.command: update-initramfs -u -k all
+      register: initramfs_result
+      changed_when: true
+      failed_when: false
+      when:
+        - update_packages
+        - update_kernel
+
+    - name: Update GRUB
+      ansible.builtin.command: update-grub
+      register: grub_result
+      changed_when: true
+      failed_when: false
+      when:
+        - update_packages
+        - update_kernel
+
+    - name: Discover installed kernels after
+      ansible.builtin.shell: |
+        find /boot -maxdepth 1 -type f -name 'vmlinuz-*' -printf '%f\n' |
+        sed 's/^vmlinuz-//' |
+        sort -V
+      register: installed_kernels_after_cmd
+      changed_when: false
+      failed_when: false
+
+    - name: Set newest installed kernel after
+      ansible.builtin.set_fact:
+        newest_installed_kernel_after: >-
+          {{
+            installed_kernels_after_cmd.stdout_lines[-1]
+            if installed_kernels_after_cmd.stdout_lines | length > 0
+            else ''
+          }}
+
+    - name: Upgrade all installed APT packages
+      ansible.builtin.apt:
+        name: "*"
+        state: latest
+        only_upgrade: true
+        update_cache: false
+      register: apt_package_upgrade
+      when:
+        - update_packages
+        - excluded_packages | length == 0
+
+    # ========================================================
+    # EXPLICIT APPLICATION PACKAGE UPDATE
+    # ========================================================
+
+    - name: Refresh APT cache before application upgrades
+      ansible.builtin.command: apt-get update
+      register: apt_refresh_for_apps
+      changed_when: false
+
+    - name: Get all upgradeable APT packages
+      ansible.builtin.shell: |
+        apt list --upgradable 2>/dev/null |
+        tail -n +2 |
+        sed 's#/.*##' |
+        sed 's/:.*//' |
+        sort -u
+      register: upgradeable_packages
+      changed_when: false
+
+    - name: Get held APT packages
+      ansible.builtin.command: apt-mark showhold
+      register: held_packages
+      changed_when: false
+      failed_when: false
+
+    - name: Temporarily remove holds from upgradeable packages
+      ansible.builtin.command:
+        argv:
+          - apt-mark
+          - unhold
+          - "{{ item }}"
+      loop: "{{ held_packages.stdout_lines | default([]) | intersect(upgradeable_packages.stdout_lines | default([])) }}"
+      register: unhold_result
+      changed_when: true
+      when:
+        - update_packages
+        - held_packages.stdout_lines | default([]) | length > 0
+        - upgradeable_packages.stdout_lines | default([]) | length > 0
+
+    - name: Upgrade every available APT package individually
+      ansible.builtin.command:
+        argv:
+          - apt-get
+          - -y
+          - --only-upgrade
+          - install
+          - "{{ item }}"
+      loop: "{{ upgradeable_packages.stdout_lines | default([]) }}"
+      register: individual_package_upgrades
+      changed_when: true
+      failed_when: false
+      when:
+        - update_packages
+        - upgradeable_packages.stdout_lines | default([]) | length > 0
+
+    # ========================================================
+    # v15 SAFE FACT INITIALIZATION
+    # ========================================================
+    - name: Initialize software lifecycle facts
+      ansible.builtin.set_fact:
+        gitlab_runner_installed: false
+        gitlab_runner_installed_version: ""
+        gitlab_runner_binary_version: ""
+        gitlab_runner_binary_path: ""
+        gitlab_runner_candidate: ""
+        gitlab_runner_update_required: false
+        apt_updates_remaining: 0
+        snap_updates_remaining: 0
+        reboot_required: false
+      changed_when: false
+
+    # ========================================================
+    # ENTERPRISE SOFTWARE LIFECYCLE FRAMEWORK v15
+    # Discovery -> Version Comparison -> Update -> Verification
+    # ========================================================
+
+    # -----------------------------
+    # 1. PACKAGE-MANAGER DISCOVERY
+    # -----------------------------
+    - name: Discover installed APT packages
+      ansible.builtin.shell: |
+        dpkg-query -W -f='${Package}\t${Version}\t${Status}\n' 2>/dev/null |
+        awk -F'\t' '$3 ~ /install ok installed/ {print $1 "\t" $2}'
+      register: apt_installed_inventory
+      changed_when: false
+      failed_when: false
+
+    - name: Discover APT upgrade candidates
+      ansible.builtin.shell: |
+        apt list --upgradable 2>/dev/null |
+        awk -F'[/ ]' 'NR > 1 && $1 != "" {print $1}'
+      register: apt_upgrade_inventory
+      changed_when: false
+      failed_when: false
+
+    - name: Count APT upgrades available
+      ansible.builtin.set_fact:
+        apt_upgrades_available: "{{ apt_upgrade_inventory.stdout_lines | default([]) | length }}"
+
+    - name: Discover installed Snap packages
+      ansible.builtin.shell: |
+        snap list 2>/dev/null |
+        awk 'NR > 1 {print $1 "\t" $2}'
+      register: snap_installed_inventory
+      changed_when: false
+      failed_when: false
+
+    - name: Discover Snap refresh candidates
+      ansible.builtin.shell: |
+        snap refresh --list 2>/dev/null |
+        awk 'NR > 1 && $1 != "" {print $1 "\t" $2 "\t" $3}'
+      register: snap_upgrade_inventory
+      changed_when: false
+      failed_when: false
+
+    - name: Discover installed kernel packages
+      ansible.builtin.shell: |
+        dpkg-query -W -f='${Package}\t${Version}\t${Status}\n' \
+          'linux-image*' 'linux-modules*' 'linux-headers*' 2>/dev/null |
+        awk -F'\t' '$3 ~ /install ok installed/ {print $1 "\t" $2}'
+      register: kernel_package_inventory
+      changed_when: false
+      failed_when: false
+
+    - name: Discover GitLab Runner if installed
+      ansible.builtin.shell: |
+        if dpkg-query -W -f='${Status}' gitlab-runner 2>/dev/null |
+           grep -q 'install ok installed'; then
+          printf 'installed\t%s\n' "$(dpkg-query -W -f='${Version}' gitlab-runner)"
+          printf 'binary\t%s\n' "$(gitlab-runner --version 2>/dev/null | awk '/^Version:/ {print $2; exit}')"
+          printf 'path\t%s\n' "$(command -v gitlab-runner 2>/dev/null || true)"
+        fi
+      register: gitlab_runner_inventory
+      changed_when: false
+      failed_when: false
+
+    # -----------------------------------------
+    # 2. APT REPOSITORY / PACKAGE HEALTH CHECK
+    # -----------------------------------------
+    - name: Set GitLab Runner discovery facts
+      ansible.builtin.set_fact:
+        gitlab_runner_installed: >-
+          {{
+            (gitlab_runner_inventory.stdout_lines | default([]) | length) > 0
+          }}
+        gitlab_runner_installed_version: >-
+          {{
+            (
+              gitlab_runner_inventory.stdout_lines | default([])
+              | select('match', '^installed\t')
+              | list | first | default('')
+            ) | regex_replace('^installed\t', '')
+          }}
+        gitlab_runner_binary_version: >-
+          {{
+            (
+              gitlab_runner_inventory.stdout_lines | default([])
+              | select('match', '^binary\t')
+              | list | first | default('')
+            ) | regex_replace('^binary\t', '')
+          }}
+        gitlab_runner_binary_path: >-
+          {{
+            (
+              gitlab_runner_inventory.stdout_lines | default([])
+              | select('match', '^path\t')
+              | list | first | default('')
+            ) | regex_replace('^path\t', '')
+          }}
+      changed_when: false
+
+    - name: Check dpkg configuration health
+      ansible.builtin.command: dpkg --audit
+      register: dpkg_audit_v15
+      changed_when: false
+      failed_when: false
+
+    - name: Repair interrupted dpkg configuration
+      ansible.builtin.command: dpkg --configure -a
+      register: dpkg_reconfigure_v15
+      changed_when: true
+      when:
+        - update_packages
+        - dpkg_audit_v15.rc != 0
+
+    - name: Refresh APT package metadata
+      ansible.builtin.command: apt-get update
+      register: apt_update_v15
+      changed_when: false
+      failed_when: false
+      when: update_packages
+
+    - name: Repair broken APT dependencies
+      ansible.builtin.command: apt-get -f install -y
+      register: apt_fix_v15
+      changed_when: true
+      failed_when: false
+      when:
+        - update_packages
+        - apt_update_v15.rc == 0
+
+    # -----------------------------------------
+    # 3. VERSION COMPARISON / UPDATE PLAN
+    # -----------------------------------------
+    - name: Refresh APT upgrade inventory after repository repair
+      ansible.builtin.shell: |
+        apt list --upgradable 2>/dev/null |
+        awk -F'[/ ]' 'NR > 1 && $1 != "" {print $1}'
+      register: apt_upgrade_inventory_final
+      changed_when: false
+      failed_when: false
+
+    - name: Determine whether APT updates are required
+      ansible.builtin.set_fact:
+        apt_updates_required_v15: >-
+          {{
+            (apt_upgrade_inventory_final.stdout_lines | default([]) | length) > 0
+          }}
+
+    - name: Build software lifecycle plan
+      ansible.builtin.set_fact:
+        software_lifecycle_plan_v15:
+          apt:
+            installed_packages: "{{ apt_installed_inventory.stdout_lines | default([]) }}"
+            upgrade_candidates: "{{ apt_upgrade_inventory_final.stdout_lines | default([]) }}"
+            updates_required: "{{ apt_updates_required_v15 }}"
+          snap:
+            installed_packages: "{{ snap_installed_inventory.stdout_lines | default([]) }}"
+            upgrade_candidates: "{{ snap_upgrade_inventory.stdout_lines | default([]) }}"
+            updates_required: "{{ (snap_upgrade_inventory.stdout_lines | default([]) | length) > 0 }}"
+          kernel:
+            installed_packages: "{{ kernel_package_inventory.stdout_lines | default([]) }}"
+          gitlab_runner:
+            installed: "{{ gitlab_runner_inventory.stdout_lines | default([]) | length > 0 }}"
+
+    # -----------------------------
+    # 4. UPDATE APT SOFTWARE
+    # -----------------------------
+    - name: Upgrade all APT-managed software
+      ansible.builtin.apt:
+        upgrade: dist
+        update_cache: false
+        force_apt_get: true
+        autoremove: false
+      register: apt_upgrade_v15
+      when:
+        - update_packages
+        - apt_updates_required_v15
+
+    - name: Upgrade all Snap software
+      ansible.builtin.command: snap refresh
+      register: snap_upgrade_v15
+      changed_when: true
+      failed_when: false
+      when:
+        - update_packages
+        - snap_upgrade_inventory.stdout_lines | default([]) | length > 0
+
+    # -----------------------------------------
+    # 5. KERNEL UPDATE / VERIFICATION
+    # -----------------------------------------
+    - name: Detect current running kernel
+      ansible.builtin.command: uname -r
+      register: kernel_running_before_v15
+      changed_when: false
+
+    - name: Detect installed kernel images
+      ansible.builtin.shell: |
+        ls -1 /boot/vmlinuz-* 2>/dev/null |
+        sed 's#^/boot/vmlinuz-##' |
+        sort -V
+      args:
+        executable: /bin/bash
+      register: kernel_images_v15
+      changed_when: false
+      failed_when: false
+
+    - name: Determine newest installed kernel
+      ansible.builtin.set_fact:
+        newest_installed_kernel_v15: >-
+          {{
+            (kernel_images_v15.stdout_lines | default([]) | last)
+            | default('', true)
+          }}
+
+    - name: Determine whether reboot is required after package update
+      ansible.builtin.shell: |
+        if [ -f /var/run/reboot-required ]; then
+          echo yes
+        else
+          echo no
+        fi
+      register: reboot_required_v15
+      changed_when: false
+      failed_when: false
+
+    # -----------------------------------------
+    # 6. GITLAB RUNNER AS A NORMAL APPLICATION
+    # -----------------------------------------
+    - name: Refresh GitLab Runner package candidate
+      ansible.builtin.shell: |
+        apt-cache policy gitlab-runner 2>/dev/null |
+        awk '/Candidate:/ {print $2; exit}'
+      register: gitlab_runner_candidate_v15
+      changed_when: false
+      failed_when: false
+      when:
+        - gitlab_runner_inventory.stdout_lines | default([]) | length > 0
+
+    - name: Determine whether GitLab Runner requires update
+      ansible.builtin.shell: |
+        installed="{{ (gitlab_runner_inventory.stdout_lines | select('match', '^installed\t') | list | first | default('installed\t')) | regex_replace('^installed\t', '') }}"
+        candidate="{{ gitlab_runner_candidate_v15.stdout | default('') | trim }}"
+
+        if [ -n "$installed" ] && [ -n "$candidate" ] &&
+           [ "$candidate" != "(none)" ] &&
+           dpkg --compare-versions "$candidate" gt "$installed"; then
+          echo yes
+        else
+          echo no
+        fi
+      args:
+        executable: /bin/bash
+      register: gitlab_runner_update_required_v15
+      changed_when: false
+      failed_when: false
+      when:
+        - gitlab_runner_inventory.stdout_lines | default([]) | length > 0
+
+    - name: Upgrade GitLab Runner through APT
+      ansible.builtin.apt:
+        name: gitlab-runner
+        state: latest
+        update_cache: false
+        force_apt_get: true
+      register: gitlab_runner_upgrade_v15
+      when:
+        - update_packages
+        - gitlab_runner_update_required_v15.stdout | default('no') | trim == 'yes'
+
+    # -----------------------------------------
+    # 7. POST-UPDATE VERIFICATION
+    # -----------------------------------------
+    - name: Refresh installed APT inventory after updates
+      ansible.builtin.shell: |
+        dpkg-query -W -f='${Package}\t${Version}\t${Status}\n' 2>/dev/null |
+        awk -F'\t' '$3 ~ /install ok installed/ {print $1 "\t" $2}'
+      register: apt_installed_inventory_after_v15
+      changed_when: false
+      failed_when: false
+
+    - name: Refresh Snap inventory after updates
+      ansible.builtin.shell: |
+        snap list 2>/dev/null |
+        awk 'NR > 1 {print $1 "\t" $2}'
+      register: snap_installed_inventory_after_v15
+      changed_when: false
+      failed_when: false
+
+    - name: Recheck remaining APT upgrades
+      ansible.builtin.shell: |
+        apt list --upgradable 2>/dev/null |
+        awk -F'[/ ]' 'NR > 1 && $1 != "" {print $1}'
+      register: remaining_apt_updates_v15
+      changed_when: false
+      failed_when: false
+
+    - name: Verify GitLab Runner after update
+      ansible.builtin.shell: |
+        if command -v gitlab-runner >/dev/null 2>&1; then
+          printf 'binary=%s\n' "$(gitlab-runner --version 2>/dev/null | awk '/^Version:/ {print $2; exit}')"
+          printf 'package=%s\n' "$(dpkg-query -W -f='${Version}' gitlab-runner 2>/dev/null || true)"
+          printf 'path=%s\n' "$(command -v gitlab-runner)"
+        fi
+      register: gitlab_runner_verification_v15
+      changed_when: false
+      failed_when: false
+      when:
+        - gitlab_runner_inventory.stdout_lines | default([]) | length > 0
+
+    - name: Verify dpkg health after updates
+      ansible.builtin.command: dpkg --audit
+      register: dpkg_audit_after_v15
+      changed_when: false
+      failed_when: false
+
+    - name: Verify APT health after updates
+      ansible.builtin.shell: |
+        apt-get check
+      register: apt_check_after_v15
+      changed_when: false
+      failed_when: false
+
+    # -----------------------------------------
+    # 8. FINAL LIFECYCLE REPORT
+    # -----------------------------------------
+    - name: Create enterprise lifecycle report
+      ansible.builtin.copy:
+        dest: /var/log/ansible-software-update/software-lifecycle-v15.json
+        owner: root
+        group: root
+        mode: "0644"
+        content: |
+          {
+            "framework": "Enterprise Software Lifecycle v15",
+            "host": {{ inventory_hostname | to_json }},
+            "os": {{ ansible_distribution ~ ' ' ~ ansible_distribution_version | to_json }},
+            "architecture": {{ ansible_architecture | to_json }},
+            "apt": {
+              "updates_before": {{ apt_upgrade_inventory.stdout_lines | default([]) | length }},
+              "updates_after": {{ remaining_apt_updates_v15.stdout_lines | default([]) | length }},
+              "upgrade_attempted": {{ (apt_upgrade_v15 is defined) | to_json }},
+              "health_rc": {{ apt_check_after_v15.rc | default(99) }}
+            },
+            "snap": {
+              "updates_before": {{ snap_upgrade_inventory.stdout_lines | default([]) | length }},
+              "upgrade_attempted": {{ (snap_upgrade_v15 is defined) | to_json }}
+            },
+            "kernel": {
+              "running_before": {{ kernel_running_before_v15.stdout | trim | to_json }},
+              "newest_installed": {{ newest_installed_kernel_v15 | to_json }},
+              "reboot_required": {{ (reboot_required_v15.stdout | default('no') | trim == 'yes') | to_json }}
+            },
+            "gitlab_runner": {
+              "installed": {{ (gitlab_runner_inventory.stdout_lines | default([]) | length > 0) | to_json }},
+              "candidate": {{ gitlab_runner_candidate_v15.stdout | default('') | trim | to_json }},
+              "update_required": {{ gitlab_runner_update_required_v15.stdout | default('no') | trim | to_json }},
+              "verification": {{ gitlab_runner_verification_v15.stdout_lines | default([]) | to_json }}
+            },
+            "dpkg": {
+              "audit_before_rc": {{ dpkg_audit_v15.rc | default(99) }},
+              "audit_after_rc": {{ dpkg_audit_after_v15.rc | default(99) }}
+            }
+          }}
+      become: true
+
+    - name: Display enterprise lifecycle summary
+      ansible.builtin.debug:
+        msg:
+          - "============================================================"
+          - "ENTERPRISE SOFTWARE LIFECYCLE v15"
+          - "============================================================"
+          - "Host: {{ inventory_hostname }}"
+          - "APT updates before: {{ apt_upgrade_inventory.stdout_lines | default([]) | length }}"
+          - "APT updates remaining: {{ remaining_apt_updates_v15.stdout_lines | default([]) | length }}"
+          - "Snap updates before: {{ snap_upgrade_inventory.stdout_lines | default([]) | length }}"
+          - "Kernel running before: {{ kernel_running_before_v15.stdout | trim }}"
+          - "Newest installed kernel: {{ newest_installed_kernel_v15 }}"
+          - "Reboot required: {{ reboot_required_v15.stdout | default('unknown') | trim }}"
+          - "GitLab Runner candidate: {{ gitlab_runner_candidate_v15.stdout | default('not installed') | trim }}"
+          - "GitLab Runner update required: {{ gitlab_runner_update_required_v15.stdout | default('no') | trim }}"
+          - "DPKG audit after: {{ 'PASS' if dpkg_audit_after_v15.rc | default(1) == 0 else 'FAIL' }}"
+          - "APT check after: {{ 'PASS' if apt_check_after_v15.rc | default(1) == 0 else 'FAIL' }}"
+          - "Report: /var/log/ansible-software-update/software-lifecycle-v15.json"
+          - "============================================================"
+
+    - name: Detect Snap
+      ansible.builtin.command: snap version
+      register: snap_detect
+      changed_when: false
+      failed_when: false
+
+    - name: Refresh Snap packages
+      ansible.builtin.command: snap refresh
+      register: snap_refresh
+      changed_when: "'All snaps up to date' not in snap_refresh.stdout"
+      failed_when: false
+      when:
+        - update_packages
+        - update_snap
+        - snap_detect.rc == 0
+
+    - name: Autoremove and autoclean
+      ansible.builtin.apt:
+        autoremove: true
+        autoclean: true
+      when:
+        - update_packages
+        - cleanup_packages
+
+    - name: Check reboot-required marker
+      ansible.builtin.stat:
+        path: /var/run/reboot-required
+      register: reboot_marker
+
+    - name: Determine kernel reboot requirement
+      ansible.builtin.set_fact:
+        kernel_reboot_required: "{{ newest_installed_kernel_after != kernel_running_before }}"
+
+    - name: Determine final reboot requirement
+      ansible.builtin.set_fact:
+        reboot_required: "{{ reboot_marker.stat.exists or kernel_reboot_required }}"
+
+    - name: Reboot to activate newest installed kernel
+      ansible.builtin.reboot:
+        msg: "Enterprise lifecycle v9 - activating updated kernel"
+        reboot_timeout: "{{ reboot_timeout }}"
+        connect_timeout: 30
+        pre_reboot_delay: 5
+        post_reboot_delay: "{{ post_reboot_delay }}"
+        test_command: uname -r
+      when:
+        - reboot_if_required
+        - reboot_required
+
+    - name: Read running kernel after update
+      ansible.builtin.command: uname -r
+      register: kernel_after_cmd
+      changed_when: false
+
+    - name: Set running kernel after update
+      ansible.builtin.set_fact:
+        kernel_running_after: "{{ kernel_after_cmd.stdout | trim }}"
+
+    - name: Fail if newest installed kernel is not running
+      ansible.builtin.fail:
+        msg: |
+          KERNEL ACTIVATION FAILED
+          Running before: {{ kernel_running_before }}
+          Newest installed: {{ newest_installed_kernel_after }}
+          Running after: {{ kernel_running_after }}
+          Inspect GRUB/default boot selection.
+      when:
+        - update_kernel
+        - reboot_if_required
+        - reboot_required
+        - kernel_running_after != newest_installed_kernel_after
+
+    - name: Final dpkg audit
+      ansible.builtin.command: dpkg --audit
+      register: dpkg_audit_after
+      changed_when: false
+      failed_when: false
+
+    - name: Final APT dependency check
+      ansible.builtin.command: apt-get check
+      register: apt_check_after
+      changed_when: false
+      failed_when: false
+
+    - name: Count remaining updates
+      ansible.builtin.shell: apt list --upgradable 2>/dev/null | tail -n +2 | wc -l
+      register: remaining_updates
+      changed_when: false
+
+    - name: Write JSON update report
+      ansible.builtin.copy:
+        dest: "{{ report_file }}"
+        owner: root
+        group: root
+        mode: "0640"
+        content: |
+          {
+            "hostname": {{ ansible_hostname | to_json }},
+            "os": {{ ansible_distribution | to_json }},
+            "os_version": {{ ansible_distribution_version | to_json }},
+            "kernel_track": {{ kernel_track | to_json }},
+            "kernel_meta_package": {{ kernel_meta_package | to_json }},
+            "kernel_meta_installed": {{ kernel_meta_installed | to_json }},
+            "kernel_meta_candidate": {{ kernel_meta_candidate | to_json }},
+            "kernel_running_before": {{ kernel_running_before | to_json }},
+            "kernel_newest_installed_after": {{ newest_installed_kernel_after | to_json }},
+            "kernel_running_after": {{ kernel_running_after | to_json }},
+            "reboot_required": {{ reboot_required | lower }},
+            "kernel_activation_verified": {{ (kernel_running_after == newest_installed_kernel_after) | lower }},
+            "remaining_updates": {{ remaining_updates.stdout | trim | int }},
+            "gitlab_runner": {
+              "installed_before": {{ gitlab_runner_installed.stdout | trim | to_json }},
+              "repository_latest": {{ gitlab_runner_latest_version | default("") | to_json }},
+              "apt_candidate": {{ gitlab_runner_candidate.stdout | default("") | trim | to_json }},
+              "installed_after": {{ gitlab_runner_version_after.stdout | default("") | trim | to_json }},
+              "executable": {{ gitlab_runner_path.stdout | default("") | trim | to_json }}
+            },
+            "gitlab_runner": {
+              "installed_before": {{ gitlab_runner_installed.stdout | trim | to_json }},
+              "candidate": {{ gitlab_runner_candidate.stdout | trim | to_json }},
+              "installed_after": {{ gitlab_runner_version_after.stdout | trim | to_json }},
+              "upgrade_required": {{ (gitlab_runner_upgrade_needed.stdout | trim == "yes") | lower }}
+            },
+            "apt_check_rc": {{ apt_check_after.rc | default(1) }},
+            "dpkg_audit_rc": {{ dpkg_audit_after.rc | default(1) }}
+          }
+
+    - name: Display final summary
+      ansible.builtin.debug:
+        msg:
+          - "============================================================"
+          - "ENTERPRISE SOFTWARE + KERNEL UPDATE v9"
+          - "============================================================"
+          - "Host: {{ ansible_hostname }}"
+          - "OS: {{ ansible_distribution }} {{ ansible_distribution_version }}"
+          - "Kernel track: {{ kernel_track }}"
+          - "Kernel meta: {{ kernel_meta_package }}"
+          - "Kernel before: {{ kernel_running_before }}"
+          - "Newest installed after: {{ newest_installed_kernel_after }}"
+          - "Kernel running after: {{ kernel_running_after }}"
+          - "Kernel activation verified: {{ kernel_running_after == newest_installed_kernel_after }}"
+          - "Automatic reboot: {{ reboot_if_required }}"
+          - "Reboot required: {{ reboot_required }}"
+          - 'Remaining updates: {{ remaining_updates.stdout | trim }}'
+          - 'GitLab Runner before: {{ gitlab_runner_installed.stdout | trim }}'
+          - 'GitLab Runner candidate: {{ gitlab_runner_candidate.stdout | trim }}'
+          - 'GitLab Runner after: {{ gitlab_runner_version_after.stdout | trim }}'
+          - "DPKG audit: {{ 'PASS' if dpkg_audit_after.rc == 0 else 'FAILED' }}"
+          - "APT check: {{ 'PASS' if apt_check_after.rc == 0 else 'FAILED' }}"
+          - "Report: {{ report_file }}"
+          - "============================================================"
