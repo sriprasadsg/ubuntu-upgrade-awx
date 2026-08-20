@@ -1,0 +1,699 @@
+---
+# ============================================================
+# Enterprise Linux Software Lifecycle + Self-Healing
+# Ubuntu/Debian
+# ============================================================
+#
+# Features:
+#   - Software inventory
+#   - APT repository validation
+#   - Safe repository self-healing
+#   - dpkg recovery
+#   - broken dependency repair
+#   - APT cache recovery/retry
+#   - all package updates
+#   - security update inventory
+#   - Generic/HWE kernel detection and update
+#   - Snap updates
+#   - reboot detection
+#   - optional automatic reboot
+#   - post-reboot kernel verification
+#   - final package health checks
+#   - JSON report
+#
+# IMPORTANT:
+#   This playbook does NOT blindly delete repositories.
+#   Invalid third-party repositories are disabled only when
+#   explicitly enabled below.
+#
+# ============================================================
+
+- name: Enterprise Linux Software Lifecycle and Self Healing
+  hosts: all
+  become: true
+  gather_facts: true
+
+  vars:
+    # -----------------------------
+    # Update controls
+    # -----------------------------
+    update_packages: true
+    update_kernel: true
+    update_snap: true
+    reboot_if_required: false
+    cleanup_packages: true
+
+    # -----------------------------
+    # Self-healing controls
+    # -----------------------------
+    self_heal: true
+    max_repair_attempts: 3
+
+    # Safely disable a repository when apt reports that it has no
+    # Release file. Disabled repositories are backed up first.
+    disable_invalid_repositories: true
+
+    # Never automatically disable these repositories.
+    protected_repository_patterns:
+      - "archive.ubuntu.com"
+      - "security.ubuntu.com"
+      - "ports.ubuntu.com"
+      - "old-releases.ubuntu.com"
+      - "archive.debian.org"
+      - "security.debian.org"
+
+    # -----------------------------
+    # Package exclusions
+    # -----------------------------
+    excluded_packages: []
+
+    # -----------------------------
+    # Reporting
+    # -----------------------------
+    report_directory: "/var/log/ansible-software-update"
+    report_file: "/var/log/ansible-software-update/software-update-report.json"
+    repair_log: "/var/log/ansible-software-update/self-healing.log"
+
+  pre_tasks:
+
+    - name: Validate supported OS
+      ansible.builtin.assert:
+        that:
+          - ansible_distribution in ['Ubuntu', 'Debian']
+        fail_msg: >
+          Unsupported OS {{ ansible_distribution }}.
+          This playbook supports Ubuntu and Debian.
+
+    - name: Create report directory
+      ansible.builtin.file:
+        path: "{{ report_directory }}"
+        state: directory
+        owner: root
+        group: root
+        mode: "0750"
+
+    - name: Record starting kernel
+      ansible.builtin.command:
+        cmd: uname -r
+      register: kernel_before_cmd
+      changed_when: false
+
+    - name: Set starting kernel
+      ansible.builtin.set_fact:
+        kernel_before: "{{ kernel_before_cmd.stdout | trim }}"
+
+  tasks:
+
+    # ========================================================
+    # A. Repository inventory
+    # ========================================================
+
+    - name: Find APT source files
+      ansible.builtin.find:
+        paths:
+          - /etc/apt/sources.list.d
+        patterns:
+          - "*.list"
+          - "*.sources"
+        file_type: file
+      register: apt_source_files
+      failed_when: false
+
+    - name: Read APT source files
+      ansible.builtin.shell: |
+        set +e
+        for f in /etc/apt/sources.list /etc/apt/sources.list.d/*.list /etc/apt/sources.list.d/*.sources; do
+          [ -f "$f" ] && echo "===== $f =====" && cat "$f"
+        done
+        exit 0
+      register: apt_sources_before
+      changed_when: false
+
+    # ========================================================
+    # B. Repair dpkg state before touching repositories
+    # ========================================================
+
+    - name: Check dpkg audit before repair
+      ansible.builtin.command:
+        cmd: dpkg --audit
+      register: dpkg_audit_before
+      changed_when: false
+      failed_when: false
+
+    - name: Configure interrupted dpkg packages
+      ansible.builtin.command:
+        cmd: dpkg --configure -a
+      register: dpkg_configure
+      when:
+        - self_heal
+        - dpkg_audit_before.stdout | trim | length > 0
+      changed_when: true
+      failed_when: false
+
+    - name: Repair broken dependencies
+      ansible.builtin.command:
+        cmd: apt-get -f install -y
+      register: dependency_repair
+      when: self_heal
+      changed_when: true
+      failed_when: false
+
+    # ========================================================
+    # C. APT repository update with controlled recovery
+    # ========================================================
+
+    - name: Initial APT update
+      ansible.builtin.command:
+        cmd: apt-get update
+      register: apt_update_initial
+      changed_when: false
+      failed_when: false
+
+    - name: Detect invalid Release-file repositories
+      ansible.builtin.set_fact:
+        invalid_release_detected: >-
+          {{
+            ('does not have a Release file' in apt_update_initial.stdout) or
+            ('does not have a Release file' in apt_update_initial.stderr) or
+            ('does not have a Release file' in apt_update_initial.msg | default(''))
+          }}
+
+    - name: Extract failing repository URLs
+      ansible.builtin.shell: |
+        {
+          printf '%s\n' "{{ apt_update_initial.stdout | default('') }}"
+          printf '%s\n' "{{ apt_update_initial.stderr | default('') }}"
+        } |
+        grep -Eo 'https?://[^[:space:]]+' |
+        sort -u || true
+      register: invalid_repository_urls
+      changed_when: false
+      when:
+        - invalid_release_detected
+        - disable_invalid_repositories
+
+    - name: Display repository problems
+      ansible.builtin.debug:
+        msg:
+          - "APT repository problem detected on {{ inventory_hostname }}"
+          - "{{ invalid_repository_urls.stdout_lines | default([]) }}"
+      when: invalid_release_detected
+
+    # We deliberately disable only source files that contain a failing URL
+    # and only if the URL is not in the protected list.
+    - name: Disable invalid third-party APT source files
+      ansible.builtin.shell: |
+        set -e
+        backup="/etc/apt/sources.list.d/ansible-disabled"
+        mkdir -p "$backup"
+
+        changed=0
+        for f in /etc/apt/sources.list.d/*.list /etc/apt/sources.list.d/*.sources; do
+          [ -f "$f" ] || continue
+
+          matched=0
+          while IFS= read -r url; do
+            [ -n "$url" ] || continue
+
+            case "$url" in
+              *archive.ubuntu.com*|*security.ubuntu.com*|*ports.ubuntu.com*|*old-releases.ubuntu.com*|*archive.debian.org*|*security.debian.org*)
+                continue
+                ;;
+            esac
+
+            if grep -qF "$url" "$f"; then
+              matched=1
+              break
+            fi
+          done <<'URLS'
+        {{ invalid_repository_urls.stdout | default('') }}
+        URLS
+
+          if [ "$matched" -eq 1 ]; then
+            base="$(basename "$f")"
+            cp -a "$f" "$backup/${base}.$(date +%Y%m%d%H%M%S).bak"
+            sed -i -E '/^[[:space:]]*(deb|Types:)/{/https?:\/\//s/^/# disabled-by-ansible: /;}' "$f"
+            echo "Disabled invalid repository source: $f"
+            changed=1
+          fi
+        done
+
+        exit 0
+      args:
+        executable: /bin/bash
+      register: repository_repair
+      when:
+        - self_heal
+        - disable_invalid_repositories
+        - invalid_release_detected
+        - invalid_repository_urls.stdout | trim | length > 0
+      changed_when: "'Disabled invalid repository source:' in repository_repair.stdout"
+      failed_when: false
+
+    - name: Retry APT update after repository repair
+      ansible.builtin.command:
+        cmd: apt-get update
+      register: apt_update_retry
+      changed_when: false
+      failed_when: false
+      when:
+        - self_heal
+        - invalid_release_detected
+
+    - name: Set final APT update result
+      ansible.builtin.set_fact:
+        apt_update_result: >-
+          {{
+            apt_update_retry
+            if (invalid_release_detected | default(false))
+            else apt_update_initial
+          }}
+
+    - name: Fail when APT repository health remains broken
+      ansible.builtin.fail:
+        msg: |
+          APT repository health remains FAILED on {{ inventory_hostname }}.
+
+          stdout:
+          {{ apt_update_result.stdout | default('') }}
+
+          stderr:
+          {{ apt_update_result.stderr | default('') }}
+
+          No further package update actions will be attempted.
+      when:
+        - apt_update_result.rc | default(1) != 0
+
+    # ========================================================
+    # D. Package inventory and update assessment
+    # ========================================================
+
+    - name: Collect installed package inventory
+      ansible.builtin.shell: |
+        dpkg-query -W -f='${binary:Package}\t${Version}\t${Architecture}\t${Status}\n'
+      register: installed_packages_before
+      changed_when: false
+
+    - name: Count installed packages
+      ansible.builtin.shell: |
+        dpkg-query -W -f='${binary:Package}\n' | wc -l
+      register: installed_package_count_before
+      changed_when: false
+
+    - name: Collect available updates
+      ansible.builtin.shell: |
+        apt list --upgradable 2>/dev/null | tail -n +2 || true
+      register: available_updates
+      changed_when: false
+
+    - name: Count available updates
+      ansible.builtin.shell: |
+        apt list --upgradable 2>/dev/null | tail -n +2 | wc -l
+      register: available_update_count
+      changed_when: false
+
+    - name: Collect security updates
+      ansible.builtin.shell: |
+        apt list --upgradable 2>/dev/null |
+        grep -Ei 'security|security.ubuntu.com|security.debian.org' ||
+        true
+      register: security_updates
+      changed_when: false
+
+    - name: Count security updates
+      ansible.builtin.shell: |
+        apt list --upgradable 2>/dev/null |
+        grep -Ei 'security|security.ubuntu.com|security.debian.org' |
+        wc -l || true
+      register: security_update_count
+      changed_when: false
+
+    - name: Collect held packages
+      ansible.builtin.command:
+        cmd: apt-mark showhold
+      register: held_packages
+      changed_when: false
+      failed_when: false
+
+    # ========================================================
+    # E. Detect kernel track
+    # ========================================================
+
+    - name: Detect HWE kernel meta package
+      ansible.builtin.shell: |
+        dpkg-query -W -f='${Status}' linux-image-generic-hwe-{{ ansible_distribution_version }} 2>/dev/null |
+        grep -q 'install ok installed'
+      register: hwe_kernel_installed
+      changed_when: false
+      failed_when: false
+
+    - name: Detect generic kernel meta package
+      ansible.builtin.shell: |
+        dpkg-query -W -f='${Status}' linux-image-generic 2>/dev/null |
+        grep -q 'install ok installed'
+      register: generic_kernel_installed
+      changed_when: false
+      failed_when: false
+
+    - name: Select kernel track
+      ansible.builtin.set_fact:
+        kernel_track: >-
+          {{
+            'hwe'
+            if hwe_kernel_installed.rc == 0
+            else 'generic'
+          }}
+
+    - name: Select kernel meta package
+      ansible.builtin.set_fact:
+        kernel_meta_package: >-
+          {{
+            'linux-generic-hwe-' + ansible_distribution_version
+            if kernel_track == 'hwe'
+            else 'linux-generic'
+          }}
+
+    - name: Display kernel plan
+      ansible.builtin.debug:
+        msg:
+          - "Kernel track: {{ kernel_track }}"
+          - "Kernel meta-package: {{ kernel_meta_package }}"
+          - "Running kernel: {{ kernel_before }}"
+
+    # ========================================================
+    # F. Kernel update
+    # ========================================================
+
+    - name: Update kernel meta package
+      ansible.builtin.apt:
+        name: "{{ kernel_meta_package }}"
+        state: latest
+        install_recommends: true
+        update_cache: false
+      register: kernel_update_result
+      when:
+        - update_packages
+        - update_kernel
+
+    - name: Rebuild initramfs
+      ansible.builtin.command:
+        cmd: update-initramfs -u -k all
+      register: initramfs_update
+      changed_when: true
+      failed_when: false
+      when:
+        - update_packages
+        - update_kernel
+        - kernel_update_result is defined
+
+    - name: Update GRUB configuration
+      ansible.builtin.command:
+        cmd: update-grub
+      register: grub_update
+      changed_when: true
+      failed_when: false
+      when:
+        - update_packages
+        - update_kernel
+        - kernel_update_result is defined
+
+    # ========================================================
+    # G. Update all packages
+    # ========================================================
+
+    - name: Upgrade all installed packages
+      ansible.builtin.apt:
+        name: "*"
+        state: latest
+        only_upgrade: true
+        update_cache: false
+        autoremove: false
+      register: package_update_result
+      when:
+        - update_packages
+        - excluded_packages | length == 0
+
+    - name: Get installed packages for selective upgrade
+      ansible.builtin.shell: |
+        dpkg-query -W -f='${binary:Package}\n'
+      register: installed_package_names
+      changed_when: false
+      when:
+        - update_packages
+        - excluded_packages | length > 0
+
+    - name: Build selective package list
+      ansible.builtin.set_fact:
+        update_package_list: >-
+          {{
+            installed_package_names.stdout_lines
+            | reject('match', '^(' + (excluded_packages | map('regex_escape') | join('|')) + ')$')
+            | list
+          }}
+      when:
+        - update_packages
+        - excluded_packages | length > 0
+
+    - name: Upgrade packages excluding protected packages
+      ansible.builtin.apt:
+        name: "{{ update_package_list }}"
+        state: latest
+        only_upgrade: true
+        update_cache: false
+        autoremove: false
+      register: package_update_result
+      when:
+        - update_packages
+        - excluded_packages | length > 0
+        - update_package_list | length > 0
+
+    # ========================================================
+    # H. Snap
+    # ========================================================
+
+    - name: Detect snap
+      ansible.builtin.command:
+        cmd: command -v snap
+      register: snap_binary
+      changed_when: false
+      failed_when: false
+
+    - name: Update Snap packages
+      ansible.builtin.command:
+        cmd: snap refresh
+      register: snap_update_result
+      changed_when: "'All snaps up to date' not in snap_update_result.stdout"
+      failed_when: false
+      when:
+        - update_packages
+        - update_snap
+        - snap_binary.rc == 0
+
+    # ========================================================
+    # I. Cleanup
+    # ========================================================
+
+    - name: Remove unused packages and clean APT cache
+      ansible.builtin.apt:
+        autoremove: true
+        autoclean: true
+      register: cleanup_result
+      when:
+        - update_packages
+        - cleanup_packages
+
+    # ========================================================
+    # J. Kernel/reboot state after updates
+    # ========================================================
+
+    - name: Find installed kernel images
+      ansible.builtin.find:
+        paths:
+          - /boot
+        patterns:
+          - "vmlinuz-*"
+        file_type: file
+      register: kernel_files_after
+
+    - name: Determine newest installed kernel
+      ansible.builtin.shell: |
+        ls -1 /boot/vmlinuz-* 2>/dev/null |
+        sed 's#^/boot/vmlinuz-##' |
+        sort -V |
+        tail -n 1
+      register: newest_kernel_cmd
+      changed_when: false
+      failed_when: false
+
+    - name: Set newest installed kernel
+      ansible.builtin.set_fact:
+        newest_installed_kernel: "{{ newest_kernel_cmd.stdout | trim }}"
+
+    - name: Check reboot-required marker
+      ansible.builtin.stat:
+        path: /var/run/reboot-required
+      register: reboot_required_file
+
+    - name: Read reboot-required packages
+      ansible.builtin.command:
+        cmd: cat /var/run/reboot-required.pkgs
+      register: reboot_required_packages
+      changed_when: false
+      failed_when: false
+      when: reboot_required_file.stat.exists
+
+    - name: Set reboot status
+      ansible.builtin.set_fact:
+        reboot_required: "{{ reboot_required_file.stat.exists }}"
+
+    # ========================================================
+    # K. Optional reboot and verification
+    # ========================================================
+
+    - name: Reboot to activate new kernel
+      ansible.builtin.reboot:
+        msg: "Ansible Enterprise Software Lifecycle kernel update"
+        reboot_timeout: 900
+        connect_timeout: 30
+        pre_reboot_delay: 5
+        post_reboot_delay: 30
+        test_command: "uname -r"
+      when:
+        - update_packages
+        - reboot_if_required
+        - reboot_required
+
+    - name: Get running kernel after optional reboot
+      ansible.builtin.command:
+        cmd: uname -r
+      register: kernel_after_cmd
+      changed_when: false
+
+    - name: Set final running kernel
+      ansible.builtin.set_fact:
+        kernel_after: "{{ kernel_after_cmd.stdout | trim }}"
+
+    - name: Verify newest kernel is running
+      ansible.builtin.assert:
+        that:
+          - kernel_after == newest_installed_kernel
+        fail_msg: >
+          Newest installed kernel {{ newest_installed_kernel }} is not running.
+          Current running kernel is {{ kernel_after }}.
+          A reboot may still be required.
+        success_msg: >
+          Kernel verification passed: {{ kernel_after }} is the newest installed kernel.
+      when:
+        - reboot_if_required
+        - reboot_required
+
+    # ========================================================
+    # L. Final health checks
+    # ========================================================
+
+    - name: Check dpkg database
+      ansible.builtin.command:
+        cmd: dpkg --audit
+      register: dpkg_audit_after
+      changed_when: false
+      failed_when: false
+
+    - name: Check APT dependency health
+      ansible.builtin.command:
+        cmd: apt-get check
+      register: apt_check_after
+      changed_when: false
+      failed_when: false
+
+    - name: Check remaining updates
+      ansible.builtin.shell: |
+        apt list --upgradable 2>/dev/null | tail -n +2 || true
+      register: remaining_updates
+      changed_when: false
+
+    - name: Count remaining updates
+      ansible.builtin.shell: |
+        apt list --upgradable 2>/dev/null | tail -n +2 | wc -l
+      register: remaining_update_count
+      changed_when: false
+
+    - name: Collect final package count
+      ansible.builtin.shell: |
+        dpkg-query -W -f='${binary:Package}\n' | wc -l
+      register: installed_package_count_after
+      changed_when: false
+
+    # ========================================================
+    # M. JSON report
+    # ========================================================
+
+    - name: Generate final JSON report
+      ansible.builtin.copy:
+        dest: "{{ report_file }}"
+        owner: root
+        group: root
+        mode: "0640"
+        content: |
+          {
+            "hostname": {{ ansible_hostname | to_json }},
+            "fqdn": {{ ansible_fqdn | to_json }},
+            "os": {{ ansible_distribution | to_json }},
+            "os_version": {{ ansible_distribution_version | to_json }},
+            "architecture": {{ ansible_architecture | to_json }},
+            "kernel": {
+              "track": {{ kernel_track | to_json }},
+              "meta_package": {{ kernel_meta_package | to_json }},
+              "before": {{ kernel_before | to_json }},
+              "newest_installed": {{ newest_installed_kernel | to_json }},
+              "running_after": {{ kernel_after | to_json }},
+              "reboot_required": {{ reboot_required | lower }}
+            },
+            "packages": {
+              "installed_before": {{ installed_package_count_before.stdout | trim | int }},
+              "available_updates_before": {{ available_update_count.stdout | trim | int }},
+              "security_updates_before": {{ security_update_count.stdout | trim | int }},
+              "installed_after": {{ installed_package_count_after.stdout | trim | int }},
+              "remaining_updates": {{ remaining_update_count.stdout | trim | int }}
+            },
+            "apt": {
+              "repository_update_rc": {{ apt_update_result.rc | default(1) }},
+              "dpkg_audit_rc": {{ dpkg_audit_after.rc | default(1) }},
+              "apt_check_rc": {{ apt_check_after.rc | default(1) }}
+            },
+            "self_healing": {
+              "enabled": {{ self_heal | lower }},
+              "invalid_repository_detected": {{ invalid_release_detected | default(false) | lower }},
+              "repository_repair_attempted": {{ repository_repair is defined | lower }},
+              "dependency_repair_attempted": {{ dependency_repair is defined | lower }}
+            },
+            "held_packages": {{ held_packages.stdout_lines | default([]) | to_json }},
+            "reboot_packages": {{ reboot_required_packages.stdout_lines | default([]) | to_json }},
+            "remaining_updates": {{ remaining_updates.stdout_lines | default([]) | to_json }}
+          }
+
+    # ========================================================
+    # N. Final summary
+    # ========================================================
+
+    - name: Enterprise software lifecycle summary
+      ansible.builtin.debug:
+        msg:
+          - "============================================================"
+          - "ENTERPRISE SOFTWARE + KERNEL SELF-HEALING SUMMARY"
+          - "============================================================"
+          - "Host: {{ ansible_hostname }}"
+          - "OS: {{ ansible_distribution }} {{ ansible_distribution_version }}"
+          - "APT repository health: {{ 'PASS' if apt_update_result.rc == 0 else 'FAILED' }}"
+          - "Self-healing enabled: {{ self_heal }}"
+          - "Invalid repository detected: {{ invalid_release_detected | default(false) }}"
+          - "Kernel track: {{ kernel_track }}"
+          - "Kernel meta-package: {{ kernel_meta_package }}"
+          - "Kernel before: {{ kernel_before }}"
+          - "Newest installed kernel: {{ newest_installed_kernel }}"
+          - "Kernel running now: {{ kernel_after }}"
+          - "Reboot required: {{ reboot_required }}"
+          - "Updates remaining: {{ remaining_update_count.stdout | trim }}"
+          - "DPKG audit: {{ 'PASS' if dpkg_audit_after.rc == 0 else 'CHECK REQUIRED' }}"
+          - "APT check: {{ 'PASS' if apt_check_after.rc == 0 else 'CHECK REQUIRED' }}"
+          - "Report: {{ report_file }}"
+          - "============================================================"
