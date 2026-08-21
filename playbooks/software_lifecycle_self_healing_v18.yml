@@ -1,0 +1,389 @@
+---
+- name: Enterprise Universal Software Lifecycle and Upstream Update Framework v18
+  hosts: all
+  become: true
+  gather_facts: true
+
+  vars:
+    report_dir: /var/log/ansible-software-update
+    report_file: "{{ report_dir }}/software-lifecycle-v18.json"
+    auto_update: true
+    auto_reboot: false
+    repair_apt: true
+    update_snap: true
+    software_bin_dirs:
+      - /usr/local/bin
+      - /usr/local/sbin
+      - /usr/bin
+      - /usr/sbin
+      - /opt/bin
+
+    known_software:
+      - {name: gitlab-runner, package: gitlab-runner, binary: gitlab-runner, update_method: apt, service: gitlab-runner}
+      - {name: docker, package: docker-ce, binary: docker, update_method: apt, service: docker}
+      - {name: kubectl, package: kubectl, binary: kubectl, update_method: apt}
+      - {name: helm, package: helm, binary: helm, update_method: apt}
+      - {name: terraform, package: terraform, binary: terraform, update_method: apt}
+      - {name: ansible, package: ansible, binary: ansible, update_method: apt}
+      - {name: nginx, package: nginx, binary: nginx, update_method: apt, service: nginx}
+      - {name: postgresql, package: postgresql, binary: psql, update_method: apt}
+      - {name: ollama, package: ollama, binary: ollama, update_method: apt, service: ollama}
+
+  pre_tasks:
+    - name: Validate operating system
+      ansible.builtin.assert:
+        that:
+          - ansible_os_family == "Debian"
+          - ansible_distribution in ["Ubuntu", "Debian"]
+        fail_msg: "v18 supports Ubuntu/Debian only."
+
+    - name: Create report directory
+      ansible.builtin.file:
+        path: "{{ report_dir }}"
+        state: directory
+        owner: root
+        group: root
+        mode: "0750"
+
+    - name: Capture running kernel before
+      ansible.builtin.command: uname -r
+      register: kernel_before
+      changed_when: false
+
+  tasks:
+    - name: Repair interrupted dpkg configuration
+      ansible.builtin.command: dpkg --configure -a
+      register: dpkg_repair
+      changed_when: false
+      failed_when: false
+      when: repair_apt
+
+    - name: Repair broken APT dependencies
+      ansible.builtin.command: apt-get -f install -y
+      register: apt_fix
+      changed_when: false
+      failed_when: false
+      when: repair_apt
+
+    - name: Refresh APT metadata
+      ansible.builtin.apt:
+        update_cache: true
+        cache_valid_time: 0
+      register: apt_update
+      failed_when: false
+
+    - name: Discover every installed dpkg package
+      ansible.builtin.command:
+        argv:
+          - dpkg-query
+          - -W
+          - -f=${Package}\t${Version}\t${Architecture}\t${Status}\n
+      register: dpkg_inventory
+      changed_when: false
+      failed_when: false
+
+    - name: Discover APT updates
+      ansible.builtin.shell: |
+        apt list --upgradable 2>/dev/null | tail -n +2
+      args:
+        executable: /bin/bash
+      register: apt_upgradable_before
+      changed_when: false
+      failed_when: false
+
+    - name: Count APT updates before
+      ansible.builtin.shell: |
+        apt list --upgradable 2>/dev/null | tail -n +2 | wc -l
+      args:
+        executable: /bin/bash
+      register: apt_updates_before
+      changed_when: false
+
+    - name: Check Snap availability
+      ansible.builtin.command: snap version
+      register: snap_available
+      changed_when: false
+      failed_when: false
+
+    - name: Discover installed Snap applications
+      ansible.builtin.command: snap list
+      register: snap_inventory
+      changed_when: false
+      failed_when: false
+      when: snap_available.rc == 0
+
+    - name: Discover Snap updates
+      ansible.builtin.command: snap refresh --list
+      register: snap_updates_before
+      changed_when: false
+      failed_when: false
+      when: snap_available.rc == 0
+
+    - name: Discover executable files
+      ansible.builtin.find:
+        paths: "{{ software_bin_dirs }}"
+        file_type: file
+        recurse: false
+      register: discovered_executables
+      failed_when: false
+
+    - name: Discover PATH-selected known binaries
+      ansible.builtin.shell: |
+        for b in gitlab-runner docker kubectl helm terraform ansible nginx psql ollama; do
+          p="$(command -v "$b" 2>/dev/null || true)"
+          [ -n "$p" ] && printf '%s\t%s\n' "$b" "$p"
+        done
+      args:
+        executable: /bin/bash
+      register: path_binaries
+      changed_when: false
+      failed_when: false
+
+    - name: Collect known package versions before update
+      ansible.builtin.shell: |
+        pkg="{{ item.package }}"
+        if dpkg-query -W -f='${Status}' "$pkg" 2>/dev/null | grep -q 'install ok installed'; then
+          installed="$(dpkg-query -W -f='${Version}' "$pkg")"
+          candidate="$(apt-cache policy "$pkg" | awk '/Candidate:/ {print $2; exit}')"
+          printf '%s\t%s\t%s\n' "$pkg" "$installed" "$candidate"
+        else
+          printf '%s\tNOT_INSTALLED\tNONE\n' "$pkg"
+        fi
+      args:
+        executable: /bin/bash
+      loop: "{{ known_software }}"
+      register: known_package_versions
+      changed_when: false
+      failed_when: false
+
+    - name: Collect known executable versions before update
+      ansible.builtin.shell: |
+        bin="{{ item.binary }}"
+        path="$(command -v "$bin" 2>/dev/null || true)"
+        if [ -n "$path" ]; then
+          printf '%s\t%s\t%s\n' "$bin" "$path" "$("$path" --version 2>&1 | head -n 1 || true)"
+        else
+          printf '%s\tNOT_FOUND\tNOT_FOUND\n' "$bin"
+        fi
+      args:
+        executable: /bin/bash
+      loop: "{{ known_software }}"
+      register: known_binary_versions
+      changed_when: false
+      failed_when: false
+
+    - name: Discover installed kernel images
+      ansible.builtin.shell: |
+        set -o pipefail
+        find /boot -maxdepth 1 -type f -name 'vmlinuz-*' -printf '%f\n' 2>/dev/null |
+          sed 's/^vmlinuz-//' | sort -V | tail -n 1
+      args:
+        executable: /bin/bash
+      register: newest_kernel_before
+      changed_when: false
+      failed_when: false
+
+    - name: Detect kernel meta package
+      ansible.builtin.shell: |
+        for p in linux-image-generic-hwe-24.04 linux-image-generic linux-image-virtual linux-image-aws linux-image-azure linux-image-gcp linux-image-kvm; do
+          if dpkg-query -W -f='${Status}' "$p" 2>/dev/null | grep -q 'install ok installed'; then
+            echo "$p"
+            exit 0
+          fi
+        done
+        exit 0
+      args:
+        executable: /bin/bash
+      register: kernel_meta_detected
+      changed_when: false
+      failed_when: false
+
+    - name: Determine kernel candidate
+      ansible.builtin.shell: |
+        p="{{ kernel_meta_detected.stdout | trim }}"
+        [ -n "$p" ] && apt-cache policy "$p" | awk '/Candidate:/ {print $2; exit}' || true
+      args:
+        executable: /bin/bash
+      register: kernel_candidate_before
+      changed_when: false
+      failed_when: false
+
+    - name: Upgrade all APT packages
+      ansible.builtin.apt:
+        upgrade: dist
+        update_cache: false
+        autoremove: false
+      register: apt_upgrade
+      when: auto_update
+
+    - name: Refresh Snap applications
+      ansible.builtin.command: snap refresh
+      register: snap_refresh
+      changed_when: false
+      failed_when: false
+      when:
+        - auto_update
+        - update_snap
+        - snap_available.rc == 0
+
+    - name: Refresh APT metadata after update
+      ansible.builtin.apt:
+        update_cache: true
+        cache_valid_time: 0
+      register: apt_update_after
+      failed_when: false
+
+    - name: Determine newest installed kernel after update
+      ansible.builtin.shell: |
+        set -o pipefail
+        find /boot -maxdepth 1 -type f -name 'vmlinuz-*' -printf '%f\n' 2>/dev/null |
+          sed 's/^vmlinuz-//' | sort -V | tail -n 1
+      args:
+        executable: /bin/bash
+      register: newest_kernel_after
+      changed_when: false
+      failed_when: false
+
+    - name: Capture running kernel after update
+      ansible.builtin.command: uname -r
+      register: kernel_after
+      changed_when: false
+
+    - name: Check reboot requirement
+      ansible.builtin.stat:
+        path: /var/run/reboot-required
+      register: reboot_required_file
+
+    - name: Optional reboot
+      ansible.builtin.reboot:
+        reboot_timeout: 900
+        connect_timeout: 30
+        post_reboot_delay: 15
+      when:
+        - auto_reboot
+        - reboot_required_file.stat.exists
+
+    - name: Verify known package versions after update
+      ansible.builtin.shell: |
+        pkg="{{ item.package }}"
+        if dpkg-query -W -f='${Status}' "$pkg" 2>/dev/null | grep -q 'install ok installed'; then
+          installed="$(dpkg-query -W -f='${Version}' "$pkg")"
+          candidate="$(apt-cache policy "$pkg" | awk '/Candidate:/ {print $2; exit}')"
+          printf '%s\t%s\t%s\n' "$pkg" "$installed" "$candidate"
+        else
+          printf '%s\tNOT_INSTALLED\tNONE\n' "$pkg"
+        fi
+      args:
+        executable: /bin/bash
+      loop: "{{ known_software }}"
+      register: known_package_versions_after
+      changed_when: false
+      failed_when: false
+
+    - name: Verify known executable versions after update
+      ansible.builtin.shell: |
+        bin="{{ item.binary }}"
+        path="$(command -v "$bin" 2>/dev/null || true)"
+        if [ -n "$path" ]; then
+          printf '%s\t%s\t%s\n' "$bin" "$path" "$("$path" --version 2>&1 | head -n 1 || true)"
+        else
+          printf '%s\tNOT_FOUND\tNOT_FOUND\n' "$bin"
+        fi
+      args:
+        executable: /bin/bash
+      loop: "{{ known_software }}"
+      register: known_binary_versions_after
+      changed_when: false
+      failed_when: false
+
+    - name: Final dpkg audit
+      ansible.builtin.command: dpkg --audit
+      register: dpkg_audit
+      changed_when: false
+      failed_when: false
+
+    - name: Final APT dependency check
+      ansible.builtin.command: apt-get check
+      register: apt_check_after
+      changed_when: false
+      failed_when: false
+
+    - name: Count remaining APT updates
+      ansible.builtin.shell: |
+        apt list --upgradable 2>/dev/null | tail -n +2 | wc -l
+      args:
+        executable: /bin/bash
+      register: apt_updates_after
+      changed_when: false
+
+    - name: Final Snap update check
+      ansible.builtin.command: snap refresh --list
+      register: snap_updates_after
+      changed_when: false
+      failed_when: false
+      when: snap_available.rc == 0
+
+    - name: Build lifecycle report
+      ansible.builtin.set_fact:
+        lifecycle_report:
+          framework: "Enterprise Universal Software Lifecycle and Upstream Update Framework"
+          version: "v18"
+          host: "{{ inventory_hostname }}"
+          os: "{{ ansible_distribution }} {{ ansible_distribution_version }}"
+          architecture: "{{ ansible_architecture }}"
+          kernel:
+            running_before: "{{ kernel_before.stdout | trim }}"
+            running_after: "{{ kernel_after.stdout | trim }}"
+            newest_installed_before: "{{ newest_kernel_before.stdout | trim }}"
+            newest_installed_after: "{{ newest_kernel_after.stdout | trim }}"
+            meta_package: "{{ kernel_meta_detected.stdout | trim }}"
+            apt_candidate: "{{ kernel_candidate_before.stdout | trim }}"
+            reboot_required: "{{ reboot_required_file.stat.exists | default(false) }}"
+          discovery:
+            dpkg_package_records: "{{ dpkg_inventory.stdout_lines | length }}"
+            executable_files: "{{ discovered_executables.files | default([]) | length }}"
+            path_selected_binaries: "{{ path_binaries.stdout_lines | default([]) }}"
+            snap_available: "{{ snap_available.rc == 0 }}"
+          apt:
+            updates_before: "{{ apt_updates_before.stdout | trim | int }}"
+            updates_after: "{{ apt_updates_after.stdout | trim | int }}"
+            update_rc: "{{ apt_upgrade.rc | default(0) }}"
+            check_rc: "{{ apt_check_after.rc | default(1) }}"
+            dpkg_audit_rc: "{{ dpkg_audit.rc | default(1) }}"
+          software:
+            package_checks_before: "{{ known_package_versions.results | default([]) }}"
+            package_checks_after: "{{ known_package_versions_after.results | default([]) }}"
+            binary_checks_before: "{{ known_binary_versions.results | default([]) }}"
+            binary_checks_after: "{{ known_binary_versions_after.results | default([]) }}"
+          repository:
+            apt_update_rc: "{{ apt_update.rc | default(1) }}"
+            apt_update_after_rc: "{{ apt_update_after.rc | default(1) }}"
+
+    - name: Write JSON report
+      ansible.builtin.copy:
+        content: "{{ lifecycle_report | to_nice_json }}"
+        dest: "{{ report_file }}"
+        owner: root
+        group: root
+        mode: "0640"
+
+    - name: Display summary
+      ansible.builtin.debug:
+        msg:
+          - "============================================================"
+          - "ENTERPRISE UNIVERSAL SOFTWARE LIFECYCLE v18"
+          - "============================================================"
+          - "Host: {{ inventory_hostname }}"
+          - "OS: {{ ansible_distribution }} {{ ansible_distribution_version }}"
+          - "APT package records: {{ dpkg_inventory.stdout_lines | length }}"
+          - "Executable files discovered: {{ discovered_executables.files | default([]) | length }}"
+          - "APT updates before: {{ apt_updates_before.stdout | trim }}"
+          - "APT updates remaining: {{ apt_updates_after.stdout | trim }}"
+          - "Kernel before: {{ kernel_before.stdout | trim }}"
+          - "Newest installed kernel: {{ newest_kernel_after.stdout | trim }}"
+          - "Kernel running: {{ kernel_after.stdout | trim }}"
+          - "Kernel reboot required: {{ 'YES' if reboot_required_file.stat.exists else 'NO' }}"
+          - "DPKG audit: {{ 'PASS' if dpkg_audit.rc == 0 else 'FAIL' }}"
+          - "APT check: {{ 'PASS' if apt_check_after.rc == 0 else 'FAIL' }}"
+          - "JSON report: {{ report_file }}"
+          - "============================================================"
