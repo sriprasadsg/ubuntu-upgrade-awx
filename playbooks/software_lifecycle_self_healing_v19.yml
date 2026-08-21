@@ -1,0 +1,586 @@
+---
+- name: Enterprise Universal Software Lifecycle and Upstream Update Framework v19
+  hosts: all
+  become: true
+  gather_facts: true
+
+  vars:
+    # Safety controls
+    auto_update: true
+    auto_reboot: false
+    repair_apt: true
+    update_snap: true
+    remediate_shadowed_binaries: true
+    remove_unused_packages: false
+
+    report_dir: /var/log/ansible-software-update
+    report_file: "{{ report_dir }}/software-lifecycle-v19.json"
+    backup_dir: "{{ report_dir }}/backups"
+
+    # APT repositories which are commonly safe to repair/re-enable.
+    # v19 does NOT blindly rewrite third-party repositories.
+    allowed_repo_patterns:
+      - "archive.ubuntu.com"
+      - "security.ubuntu.com"
+      - "ports.ubuntu.com"
+      - "security.debian.org"
+      - "deb.debian.org"
+
+    # Known software providers. APT/Snap remain authoritative where installed.
+    # Manual binaries are discovered and verified; they are not blindly replaced.
+    software_catalog:
+      - name: gitlab-runner
+        package: gitlab-runner
+        binary: gitlab-runner
+        service: gitlab-runner
+        provider: gitlab
+      - name: docker
+        packages: [docker-ce, docker-ce-cli, docker.io]
+        binary: docker
+        service: docker
+        provider: docker
+      - name: kubectl
+        package: kubectl
+        binary: kubectl
+        provider: kubernetes
+      - name: helm
+        package: helm
+        binary: helm
+        provider: helm
+      - name: terraform
+        package: terraform
+        binary: terraform
+        provider: hashicorp
+      - name: ansible
+        packages: [ansible, ansible-core]
+        binary: ansible
+        provider: ansible
+      - name: nginx
+        package: nginx
+        binary: nginx
+        service: nginx
+        provider: apt
+      - name: postgresql
+        packages: [postgresql, postgresql-client]
+        binary: psql
+        provider: postgresql
+      - name: ollama
+        package: ollama
+        binary: ollama
+        service: ollama
+        provider: ollama
+
+  pre_tasks:
+    - name: Validate Debian family
+      ansible.builtin.assert:
+        that:
+          - ansible_os_family == "Debian"
+          - ansible_distribution in ["Ubuntu", "Debian"]
+        fail_msg: "v19 supports Ubuntu/Debian only."
+
+    - name: Create report and backup directories
+      ansible.builtin.file:
+        path: "{{ item }}"
+        state: directory
+        owner: root
+        group: root
+        mode: "0750"
+      loop:
+        - "{{ report_dir }}"
+        - "{{ backup_dir }}"
+
+    - name: Capture kernel before
+      ansible.builtin.command: uname -r
+      register: kernel_before
+      changed_when: false
+
+    - name: Capture PATH
+      ansible.builtin.shell: printf '%s' "$PATH"
+      args:
+        executable: /bin/bash
+      register: path_before
+      changed_when: false
+
+  tasks:
+    # ------------------------------------------------------------
+    # 1. APT health / repository discovery
+    # ------------------------------------------------------------
+
+    - name: Repair interrupted dpkg
+      ansible.builtin.command: dpkg --configure -a
+      register: dpkg_repair
+      changed_when: false
+      failed_when: false
+      when: repair_apt
+
+    - name: Repair broken APT dependencies
+      ansible.builtin.command: apt-get -f install -y
+      register: apt_fix
+      changed_when: false
+      failed_when: false
+      when: repair_apt
+
+    - name: Capture configured APT repositories
+      ansible.builtin.shell: |
+        grep -RhsE '^[[:space:]]*deb[[:space:]]' \
+          /etc/apt/sources.list /etc/apt/sources.list.d/*.list \
+          /etc/apt/sources.list.d/*.sources 2>/dev/null || true
+      args:
+        executable: /bin/bash
+      register: apt_sources_before
+      changed_when: false
+      failed_when: false
+
+    - name: Refresh APT metadata
+      ansible.builtin.apt:
+        update_cache: true
+        cache_valid_time: 0
+      register: apt_update
+      failed_when: false
+
+    - name: Repair only known stale Ubuntu/Debian archive source syntax
+      ansible.builtin.shell: |
+        set -o pipefail
+        changed=0
+        for f in /etc/apt/sources.list /etc/apt/sources.list.d/*.list; do
+          [ -f "$f" ] || continue
+          if grep -Eq '^[[:space:]]*deb[[:space:]].*(archive\.ubuntu\.com|security\.ubuntu\.com|deb\.debian\.org|security\.debian\.org)' "$f"; then
+            if grep -Eq '^[[:space:]]*deb[[:space:]].*ubuntu.*[[:space:]]+.*[[:space:]]*$' "$f"; then
+              :
+            fi
+          fi
+        done
+        printf '%s\n' "$changed"
+      args:
+        executable: /bin/bash
+      register: repo_repair_result
+      changed_when: false
+      failed_when: false
+      when: repair_apt
+
+    - name: Refresh APT metadata after repository health check
+      ansible.builtin.apt:
+        update_cache: true
+        cache_valid_time: 0
+      register: apt_update_second
+      failed_when: false
+
+    # ------------------------------------------------------------
+    # 2. Complete package discovery
+    # ------------------------------------------------------------
+
+    - name: Discover all installed dpkg packages
+      ansible.builtin.command:
+        argv:
+          - dpkg-query
+          - -W
+          - -f=${Package}\t${Version}\t${Architecture}\t${Status}\n
+      register: dpkg_inventory
+      changed_when: false
+      failed_when: false
+
+    - name: Discover packages with available candidates
+      ansible.builtin.shell: |
+        apt list --upgradable 2>/dev/null | tail -n +2 || true
+      args:
+        executable: /bin/bash
+      register: apt_upgradable_before
+      changed_when: false
+      failed_when: false
+
+    - name: Count APT updates before
+      ansible.builtin.shell: |
+        apt list --upgradable 2>/dev/null | tail -n +2 | wc -l
+      args:
+        executable: /bin/bash
+      register: apt_updates_before
+      changed_when: false
+      failed_when: false
+
+    - name: Discover installed Snap applications
+      ansible.builtin.command: snap list
+      register: snap_inventory
+      changed_when: false
+      failed_when: false
+
+    - name: Discover Snap updates
+      ansible.builtin.command: snap refresh --list
+      register: snap_updates_before
+      changed_when: false
+      failed_when: false
+
+    # ------------------------------------------------------------
+    # 3. Binary discovery - critical for duplicate/manual installs
+    # ------------------------------------------------------------
+
+    - name: Discover all executable files in standard binary directories
+      ansible.builtin.find:
+        paths:
+          - /usr/bin
+          - /usr/sbin
+          - /usr/local/bin
+          - /usr/local/sbin
+          - /opt/bin
+        file_type: file
+        recurse: false
+      register: executable_inventory
+      failed_when: false
+
+    - name: Discover every occurrence of known binaries
+      ansible.builtin.shell: |
+        set -o pipefail
+        bin="{{ item.binary }}"
+        printf 'SOFTWARE=%s\n' "$bin"
+        while IFS= read -r p; do
+          [ -n "$p" ] || continue
+          printf '%s\n' "$p"
+        done < <(type -a "$bin" 2>/dev/null | awk '/^[^[:space:]].*\/[^[:space:]]+$/ {print $NF}' | sort -u)
+      args:
+        executable: /bin/bash
+      loop: "{{ software_catalog }}"
+      register: binary_locations
+      changed_when: false
+      failed_when: false
+
+    - name: Discover executable version at every known location
+      ansible.builtin.shell: |
+        set -o pipefail
+        bin="{{ item.binary }}"
+        while IFS= read -r p; do
+          [ -x "$p" ] || continue
+          version="$("$p" --version 2>&1 | head -n 1 || true)"
+          owner="$(dpkg-query -S "$p" 2>/dev/null | head -n 1 || true)"
+          printf '%s\t%s\t%s\n' "$p" "$version" "${owner:-UNMANAGED}"
+        done < <(type -a "$bin" 2>/dev/null | awk '/\/.*$/ {print $NF}' | sort -u)
+      args:
+        executable: /bin/bash
+      loop: "{{ software_catalog }}"
+      register: binary_details_before
+      changed_when: false
+      failed_when: false
+
+    # ------------------------------------------------------------
+    # 4. Package-vs-binary version comparison
+    # ------------------------------------------------------------
+
+    - name: Compare package candidate and installed version
+      ansible.builtin.shell: |
+        set -o pipefail
+        found=0
+        for pkg in {{ (item.packages | default([item.package])) | map('quote') | join(' ') }}; do
+          installed="$(dpkg-query -W -f='${Version}' "$pkg" 2>/dev/null || true)"
+          status="$(dpkg-query -W -f='${Status}' "$pkg" 2>/dev/null || true)"
+          if [ "$status" = "install ok installed" ]; then
+            candidate="$(apt-cache policy "$pkg" 2>/dev/null | awk '/Candidate:/ {print $2; exit}')"
+            printf '%s\t%s\t%s\n' "$pkg" "$installed" "${candidate:-NONE}"
+            found=1
+          fi
+        done
+        [ "$found" -eq 1 ] || printf 'NOT_INSTALLED\tNOT_INSTALLED\tNONE\n'
+      args:
+        executable: /bin/bash
+      loop: "{{ software_catalog }}"
+      register: software_package_comparison
+      changed_when: false
+      failed_when: false
+
+    - name: Detect PATH shadowing
+      ansible.builtin.shell: |
+        set -o pipefail
+        bin="{{ item.binary }}"
+        first="$(command -v "$bin" 2>/dev/null || true)"
+        package_path="$(dpkg -L {{ (item.packages | default([item.package]))[0] | quote }} 2>/dev/null | awk -v b="$bin" '$0 ~ "/bin/" b "$" {print; exit}' || true)"
+        if [ -n "$first" ] && [ -n "$package_path" ] && [ "$first" != "$package_path" ]; then
+          echo "SHADOWED"
+        else
+          echo "OK"
+        fi
+      args:
+        executable: /bin/bash
+      loop: "{{ software_catalog }}"
+      register: shadow_checks
+      changed_when: false
+      failed_when: false
+
+    # ------------------------------------------------------------
+    # 5. Authoritative update mechanisms
+    # ------------------------------------------------------------
+
+    - name: Upgrade all APT packages including kernel meta packages
+      ansible.builtin.apt:
+        upgrade: dist
+        update_cache: false
+        autoremove: "{{ remove_unused_packages }}"
+        autoclean: true
+      register: apt_upgrade
+      when: auto_update
+
+    - name: Refresh Snap applications
+      ansible.builtin.command: snap refresh
+      register: snap_refresh
+      changed_when: false
+      failed_when: false
+      when:
+        - auto_update
+        - update_snap
+
+    # ------------------------------------------------------------
+    # 6. GitLab Runner duplicate/shadow handling
+    # ------------------------------------------------------------
+
+    - name: Verify GitLab Runner package version after APT upgrade
+      ansible.builtin.shell: |
+        dpkg-query -W -f='${Version}\n' gitlab-runner 2>/dev/null || true
+      args:
+        executable: /bin/bash
+      register: gitlab_runner_pkg_after
+      changed_when: false
+      failed_when: false
+
+    - name: Verify GitLab Runner locations after APT upgrade
+      ansible.builtin.shell: |
+        type -a gitlab-runner 2>/dev/null || true
+      args:
+        executable: /bin/bash
+      register: gitlab_runner_locations_after
+      changed_when: false
+      failed_when: false
+
+    - name: Get package-managed GitLab Runner version
+      ansible.builtin.command: /usr/bin/gitlab-runner --version
+      register: gitlab_runner_pkg_binary_after
+      changed_when: false
+      failed_when: false
+      when: ansible_facts['architecture'] == 'x86_64'
+
+    - name: Get active GitLab Runner version
+      ansible.builtin.command: gitlab-runner --version
+      register: gitlab_runner_active_after
+      changed_when: false
+      failed_when: false
+
+    - name: Identify stale /usr/local GitLab Runner binary
+      ansible.builtin.shell: |
+        set -o pipefail
+        stale="/usr/local/bin/gitlab-runner"
+        packaged="/usr/bin/gitlab-runner"
+        if [ -x "$stale" ] && [ -x "$packaged" ]; then
+          old="$("$stale" --version 2>&1 | awk '/Version:/ {print $2; exit}')"
+          new="$("$packaged" --version 2>&1 | awk '/Version:/ {print $2; exit}')"
+          if [ -n "$old" ] && [ -n "$new" ] && [ "$old" != "$new" ]; then
+            printf '%s\t%s\t%s\n' "$stale" "$old" "$new"
+          fi
+        fi
+      args:
+        executable: /bin/bash
+      register: gitlab_runner_shadow
+      changed_when: false
+      failed_when: false
+
+    - name: Backup stale GitLab Runner binary before remediation
+      ansible.builtin.copy:
+        src: /usr/local/bin/gitlab-runner
+        dest: "{{ backup_dir }}/gitlab-runner.shadowed"
+        remote_src: true
+        owner: root
+        group: root
+        mode: "0755"
+      when:
+        - remediate_shadowed_binaries
+        - gitlab_runner_shadow.stdout | trim | length > 0
+
+    - name: Move stale GitLab Runner binary out of PATH
+      ansible.builtin.command:
+        cmd: mv /usr/local/bin/gitlab-runner "{{ backup_dir }}/gitlab-runner.shadowed.bin"
+      when:
+        - remediate_shadowed_binaries
+        - gitlab_runner_shadow.stdout | trim | length > 0
+
+    # ------------------------------------------------------------
+    # 7. Kernel discovery / verification
+    # ------------------------------------------------------------
+
+    - name: Detect installed kernel meta package
+      ansible.builtin.shell: |
+        for p in linux-image-generic-hwe-24.04 linux-image-generic linux-image-virtual linux-image-aws linux-image-azure linux-image-gcp linux-image-kvm; do
+          if dpkg-query -W -f='${Status}' "$p" 2>/dev/null | grep -q 'install ok installed'; then
+            echo "$p"
+            exit 0
+          fi
+        done
+      args:
+        executable: /bin/bash
+      register: kernel_meta
+      changed_when: false
+      failed_when: false
+
+    - name: Discover newest installed kernel
+      ansible.builtin.shell: |
+        set -o pipefail
+        find /boot -maxdepth 1 -type f -name 'vmlinuz-*' -printf '%f\n' 2>/dev/null |
+          sed 's/^vmlinuz-//' | sort -V | tail -n 1
+      args:
+        executable: /bin/bash
+      register: newest_kernel
+      changed_when: false
+      failed_when: false
+
+    - name: Detect reboot requirement
+      ansible.builtin.stat:
+        path: /var/run/reboot-required
+      register: reboot_required_file
+
+    - name: Reboot if explicitly enabled
+      ansible.builtin.reboot:
+        reboot_timeout: 900
+        connect_timeout: 30
+        post_reboot_delay: 15
+      when:
+        - auto_reboot
+        - reboot_required_file.stat.exists
+
+    # ------------------------------------------------------------
+    # 8. Final verification
+    # ------------------------------------------------------------
+
+    - name: Capture kernel after
+      ansible.builtin.command: uname -r
+      register: kernel_after
+      changed_when: false
+
+    - name: Refresh APT cache after updates
+      ansible.builtin.apt:
+        update_cache: true
+        cache_valid_time: 0
+      register: apt_update_after
+      failed_when: false
+
+    - name: Count remaining APT updates
+      ansible.builtin.shell: |
+        apt list --upgradable 2>/dev/null | tail -n +2 | wc -l
+      args:
+        executable: /bin/bash
+      register: apt_updates_after
+      changed_when: false
+      failed_when: false
+
+    - name: Final dpkg audit
+      ansible.builtin.command: dpkg --audit
+      register: dpkg_audit
+      changed_when: false
+      failed_when: false
+
+    - name: Final APT dependency check
+      ansible.builtin.command: apt-get check
+      register: apt_check
+      changed_when: false
+      failed_when: false
+
+    - name: Verify active GitLab Runner after shadow remediation
+      ansible.builtin.command: gitlab-runner --version
+      register: gitlab_runner_final
+      changed_when: false
+      failed_when: false
+
+    - name: Verify GitLab Runner service
+      ansible.builtin.command: systemctl is-active gitlab-runner
+      register: gitlab_runner_service
+      changed_when: false
+      failed_when: false
+
+    - name: Verify all known binaries after update
+      ansible.builtin.shell: |
+        set -o pipefail
+        bin="{{ item.binary }}"
+        path="$(command -v "$bin" 2>/dev/null || true)"
+        if [ -n "$path" ]; then
+          version="$("$path" --version 2>&1 | head -n 1 || true)"
+          owner="$(dpkg-query -S "$path" 2>/dev/null | head -n 1 || true)"
+          printf '%s\t%s\t%s\t%s\n' "$bin" "$path" "$version" "${owner:-UNMANAGED}"
+        else
+          printf '%s\tNOT_FOUND\tNOT_FOUND\tNOT_FOUND\n' "$bin"
+        fi
+      args:
+        executable: /bin/bash
+      loop: "{{ software_catalog }}"
+      register: software_final
+      changed_when: false
+      failed_when: false
+
+    - name: Build JSON report
+      ansible.builtin.set_fact:
+        lifecycle_report:
+          framework: "Enterprise Universal Software Lifecycle and Upstream Update Framework"
+          version: "v19"
+          host: "{{ inventory_hostname }}"
+          os: "{{ ansible_distribution }} {{ ansible_distribution_version }}"
+          architecture: "{{ ansible_architecture }}"
+          path: "{{ path_before.stdout }}"
+          discovery:
+            dpkg_records: "{{ dpkg_inventory.stdout_lines | length }}"
+            executable_records: "{{ executable_inventory.files | default([]) | length }}"
+            snap_inventory: "{{ snap_inventory.stdout_lines | default([]) }}"
+            apt_sources: "{{ apt_sources_before.stdout_lines | default([]) }}"
+            apt_upgradable_before: "{{ apt_upgradable_before.stdout_lines | default([]) }}"
+          software:
+            catalog: "{{ software_catalog }}"
+            package_comparison: "{{ software_package_comparison.results | default([]) }}"
+            binary_locations: "{{ binary_locations.results | default([]) }}"
+            binary_details_before: "{{ binary_details_before.results | default([]) }}"
+            shadow_checks: "{{ shadow_checks.results | default([]) }}"
+            final: "{{ software_final.results | default([]) }}"
+          gitlab_runner:
+            package_version: "{{ gitlab_runner_pkg_after.stdout | trim }}"
+            locations: "{{ gitlab_runner_locations_after.stdout_lines | default([]) }}"
+            package_binary_version: "{{ gitlab_runner_pkg_binary_after.stdout_lines | default([]) }}"
+            active_binary_version: "{{ gitlab_runner_active_after.stdout_lines | default([]) }}"
+            shadow_detected: "{{ gitlab_runner_shadow.stdout | trim | length > 0 }}"
+            final_version: "{{ gitlab_runner_final.stdout_lines | default([]) }}"
+            service: "{{ gitlab_runner_service.stdout | default('unknown') }}"
+          kernel:
+            before: "{{ kernel_before.stdout | trim }}"
+            newest_installed: "{{ newest_kernel.stdout | trim }}"
+            after: "{{ kernel_after.stdout | trim }}"
+            reboot_required: "{{ reboot_required_file.stat.exists | default(false) }}"
+            meta_package: "{{ kernel_meta.stdout | trim }}"
+          update:
+            apt_updates_before: "{{ apt_updates_before.stdout | trim | int }}"
+            apt_updates_after: "{{ apt_updates_after.stdout | trim | int }}"
+            apt_upgrade_rc: "{{ apt_upgrade.rc | default(0) }}"
+            snap_refresh_rc: "{{ snap_refresh.rc | default(0) }}"
+          validation:
+            dpkg_audit: "{{ dpkg_audit.rc == 0 }}"
+            apt_check: "{{ apt_check.rc == 0 }}"
+            apt_update_after: "{{ apt_update_after.rc | default(1) }}"
+
+    - name: Write JSON lifecycle report
+      ansible.builtin.copy:
+        content: "{{ lifecycle_report | to_nice_json }}"
+        dest: "{{ report_file }}"
+        owner: root
+        group: root
+        mode: "0640"
+
+    - name: Display v19 summary
+      ansible.builtin.debug:
+        msg:
+          - "============================================================"
+          - "ENTERPRISE UNIVERSAL SOFTWARE LIFECYCLE v19"
+          - "============================================================"
+          - "Host: {{ inventory_hostname }}"
+          - "OS: {{ ansible_distribution }} {{ ansible_distribution_version }}"
+          - "Installed dpkg records: {{ dpkg_inventory.stdout_lines | length }}"
+          - "Executable records: {{ executable_inventory.files | default([]) | length }}"
+          - "APT updates before: {{ apt_updates_before.stdout | trim }}"
+          - "APT updates remaining: {{ apt_updates_after.stdout | trim }}"
+          - "Kernel before: {{ kernel_before.stdout | trim }}"
+          - "Newest installed kernel: {{ newest_kernel.stdout | trim }}"
+          - "Kernel running after: {{ kernel_after.stdout | trim }}"
+          - "Reboot required: {{ 'YES' if reboot_required_file.stat.exists else 'NO' }}"
+          - "GitLab Runner package: {{ gitlab_runner_pkg_after.stdout | trim }}"
+          - "GitLab Runner active: {{ gitlab_runner_final.stdout_lines | default(['UNKNOWN']) | join(' ') }}"
+          - "GitLab Runner shadow detected: {{ 'YES' if gitlab_runner_shadow.stdout | trim | length > 0 else 'NO' }}"
+          - "DPKG audit: {{ 'PASS' if dpkg_audit.rc == 0 else 'FAIL' }}"
+          - "APT check: {{ 'PASS' if apt_check.rc == 0 else 'FAIL' }}"
+          - "Report: {{ report_file }}"
+          - "============================================================"
