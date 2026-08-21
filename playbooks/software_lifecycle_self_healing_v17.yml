@@ -1,0 +1,693 @@
+---
+- name: Enterprise Linux Software and Kernel Lifecycle v17
+  hosts: all
+  become: true
+  gather_facts: true
+
+  vars:
+    update_packages: true
+    update_snap: true
+    update_kernel: true
+    repair_package_manager: true
+    reboot_after_kernel_update: false
+
+    # Set true only if you explicitly want failed third-party APT sources
+    # to be disabled automatically. Default is safe: false.
+    disable_failed_third_party_repos: false
+
+    report_dir: /var/log/ansible-software-update
+    report_file: /var/log/ansible-software-update/software-lifecycle-v17.json
+
+  pre_tasks:
+    - name: Initialize all lifecycle facts
+      ansible.builtin.set_fact:
+        apt_update_ok: false
+        apt_repair_attempted: false
+        apt_updates_before: []
+        apt_updates_after: []
+        snap_updates_before: []
+        snap_updates_after: []
+        installed_kernel_images: []
+        newest_installed_kernel: ""
+        kernel_running_before: "{{ ansible_kernel }}"
+        kernel_running_after: "{{ ansible_kernel }}"
+        kernel_meta_package: ""
+        kernel_track: "unknown"
+        kernel_candidate: ""
+        kernel_update_required: false
+        reboot_required: false
+        failed_apt_sources: []
+        external_software_inventory: []
+        lifecycle_errors: []
+      changed_when: false
+
+    - name: Validate Ubuntu/Debian package manager
+      ansible.builtin.assert:
+        that:
+          - ansible_facts.os_family == "Debian"
+          - ansible_facts.pkg_mgr == "apt"
+        fail_msg: >-
+          This playbook is designed for Debian-family systems using APT.
+          Detected OS={{ ansible_facts.distribution }}
+          package_manager={{ ansible_facts.pkg_mgr }}.
+
+  tasks:
+    # ============================================================
+    # PHASE 1 - PRE-FLIGHT
+    # ============================================================
+
+    - name: Check required commands
+      ansible.builtin.shell: |
+        for c in apt-get apt-cache dpkg awk sed sort find uname; do
+          command -v "$c" >/dev/null 2>&1 || echo "$c"
+        done
+      args:
+        executable: /bin/bash
+      register: missing_commands
+      changed_when: false
+
+    - name: Check disk space
+      ansible.builtin.shell: |
+        df -P / /boot 2>/dev/null | awk 'NR>1 {print $6 "\t" $5 "\t" $4}'
+      register: filesystem_space
+      changed_when: false
+
+    - name: Check dpkg state before update
+      ansible.builtin.command: dpkg --audit
+      register: dpkg_audit_before
+      changed_when: false
+      failed_when: false
+
+    # ============================================================
+    # PHASE 2 - APT REPOSITORY DISCOVERY + INTERNET REFRESH
+    # ============================================================
+
+    - name: Read configured APT sources
+      ansible.builtin.shell: |
+        grep -RhsE '^[[:space:]]*(deb|deb-src)[[:space:]]+' \
+          /etc/apt/sources.list /etc/apt/sources.list.d \
+          2>/dev/null || true
+      args:
+        executable: /bin/bash
+      register: apt_sources
+      changed_when: false
+
+    - name: Refresh APT metadata from configured repositories
+      ansible.builtin.command:
+        argv:
+          - apt-get
+          - update
+          - -o
+          - Acquire::Retries=3
+          - -o
+          - APT::Update::Error-Mode=any
+      register: apt_update_result
+      changed_when: false
+      failed_when: false
+      when: update_packages
+
+    - name: Set APT update status
+      ansible.builtin.set_fact:
+        apt_update_ok: "{{ apt_update_result.rc | default(1) == 0 }}"
+        lifecycle_errors: >-
+          {{
+            lifecycle_errors +
+            ([] if (apt_update_result.rc | default(1) == 0)
+             else ['apt-get update failed'])
+          }}
+
+    - name: Capture failed APT repository hints
+      ansible.builtin.set_fact:
+        failed_apt_sources: >-
+          {{
+            (
+              (apt_update_result.stdout | default('')) ~ '\n' ~
+              (apt_update_result.stderr | default(''))
+            )
+            | regex_findall('https?://[^[:space:]]+|[A-Za-z0-9._-]+\\.list')
+            | unique
+            | list
+          }}
+      when: update_packages
+
+    # Safe package-manager repair. This does NOT blindly rewrite repositories.
+    - name: Repair interrupted dpkg configuration
+      ansible.builtin.command: dpkg --configure -a
+      register: dpkg_repair
+      changed_when: true
+      failed_when: false
+      when:
+        - repair_package_manager
+        - dpkg_audit_before.rc | default(0) != 0
+
+    - name: Repair broken APT dependencies
+      ansible.builtin.command:
+        argv:
+          - apt-get
+          - -f
+          - install
+          - -y
+          - -o
+          - Acquire::Retries=3
+      register: apt_dependency_repair
+      changed_when: true
+      failed_when: false
+      when:
+        - repair_package_manager
+        - update_packages
+
+    - name: Refresh APT metadata after package repair
+      ansible.builtin.command:
+        argv:
+          - apt-get
+          - update
+          - -o
+          - Acquire::Retries=3
+          - -o
+          - APT::Update::Error-Mode=any
+      register: apt_update_after_repair
+      changed_when: false
+      failed_when: false
+      when:
+        - repair_package_manager
+        - update_packages
+
+    # ============================================================
+    # PHASE 3 - DISCOVER ALL APT INSTALLED SOFTWARE + CANDIDATES
+    # ============================================================
+
+    - name: Inventory every installed APT/dpkg package
+      ansible.builtin.shell: |
+        dpkg-query -W -f='${Package}\t${Version}\t${Architecture}\t${Status}\n' 2>/dev/null |
+        awk -F'\t' '$4 ~ /install ok installed/ {print}'
+      args:
+        executable: /bin/bash
+      register: apt_installed_inventory
+      changed_when: false
+      failed_when: false
+
+    - name: Discover every APT package with an upgrade available
+      ansible.builtin.shell: |
+        apt list --upgradable 2>/dev/null |
+        awk 'NR > 1 && $1 !~ /^Listing/ {
+          pkg=$1
+          sub(/\/.*/, "", pkg)
+          print pkg
+        }' |
+        sort -u
+      args:
+        executable: /bin/bash
+      register: apt_upgrade_names
+      changed_when: false
+      failed_when: false
+
+    - name: Build exact APT upgrade version inventory
+      ansible.builtin.shell: |
+        apt list --upgradable 2>/dev/null |
+        awk 'NR > 1 && $1 !~ /^Listing/ {
+          pkg=$1
+          sub(/\/.*/, "", pkg)
+          print pkg "\t" $2
+        }' |
+        sort -u
+      args:
+        executable: /bin/bash
+      register: apt_upgrade_versions
+      changed_when: false
+      failed_when: false
+
+    - name: Determine APT upgrade count
+      ansible.builtin.set_fact:
+        apt_updates_before: "{{ apt_upgrade_versions.stdout_lines | default([]) }}"
+
+    # ============================================================
+    # PHASE 4 - KERNEL TRACK DETECTION + LATEST REPOSITORY KERNEL
+    # ============================================================
+
+    - name: Detect installed kernel meta-packages
+      ansible.builtin.shell: |
+        for p in \
+          linux-image-generic-hwe-{{ ansible_facts.distribution_version }} \
+          linux-image-generic \
+          linux-image-virtual \
+          linux-image-aws \
+          linux-image-gcp \
+          linux-image-azure \
+          linux-image-kvm; do
+          if dpkg-query -W -f='${Status}' "$p" 2>/dev/null |
+             grep -q 'install ok installed'; then
+            echo "$p"
+          fi
+        done
+      args:
+        executable: /bin/bash
+      register: kernel_meta_detect
+      changed_when: false
+      failed_when: false
+
+    - name: Select kernel meta-package
+      ansible.builtin.set_fact:
+        kernel_meta_package: >-
+          {{
+            kernel_meta_detect.stdout_lines | default([])
+            | first | default('')
+          }}
+
+    - name: Determine kernel track
+      ansible.builtin.set_fact:
+        kernel_track: >-
+          {{
+            'hwe' if 'hwe' in kernel_meta_package
+            else ('generic' if kernel_meta_package == 'linux-image-generic'
+                  else ('cloud/virtual' if kernel_meta_package != '' else 'unknown'))
+          }}
+
+    - name: Discover installed kernel images
+      ansible.builtin.shell: |
+        find /boot -maxdepth 1 -type f -name 'vmlinuz-*' -printf '%f\n' 2>/dev/null |
+        sed 's/^vmlinuz-//' |
+        sort -V
+      args:
+        executable: /bin/bash
+      register: kernel_images_result
+      changed_when: false
+      failed_when: false
+
+    - name: Set installed kernel inventory
+      ansible.builtin.set_fact:
+        installed_kernel_images: "{{ kernel_images_result.stdout_lines | default([]) }}"
+        newest_installed_kernel: >-
+          {{ kernel_images_result.stdout_lines | default([]) | last | default('') }}
+
+    - name: Query latest kernel meta-package candidate from APT
+      ansible.builtin.shell: |
+        if [ -n "{{ kernel_meta_package }}" ]; then
+          apt-cache policy "{{ kernel_meta_package }}" 2>/dev/null |
+          awk '/Candidate:/ {print $2; exit}'
+        elif [ "{{ ansible_facts.distribution_version }}" = "24.04" ]; then
+          apt-cache policy linux-image-generic-hwe-24.04 linux-image-generic 2>/dev/null |
+          awk '/Candidate:/ && $2 != "(none)" {print $2; exit}'
+        else
+          apt-cache policy linux-image-generic 2>/dev/null |
+          awk '/Candidate:/ {print $2; exit}'
+        fi
+      args:
+        executable: /bin/bash
+      register: kernel_meta_candidate_result
+      changed_when: false
+      failed_when: false
+
+    - name: Set kernel candidate
+      ansible.builtin.set_fact:
+        kernel_candidate: "{{ kernel_meta_candidate_result.stdout | trim }}"
+
+    - name: Determine whether kernel meta-package requires update
+      ansible.builtin.shell: |
+        if [ -n "{{ kernel_meta_package }}" ] &&
+           [ -n "{{ kernel_candidate }}" ] &&
+           [ "{{ kernel_candidate }}" != "(none)" ]; then
+          installed="$(dpkg-query -W -f='${Version}' "{{ kernel_meta_package }}" 2>/dev/null || true)"
+          if [ -n "$installed" ] &&
+             dpkg --compare-versions "$kernel_candidate" gt "$installed"; then
+            echo yes
+          else
+            echo no
+          fi
+        else
+          echo no
+        fi
+      args:
+        executable: /bin/bash
+      register: kernel_meta_update_required_result
+      changed_when: false
+      failed_when: false
+
+    - name: Set kernel update requirement
+      ansible.builtin.set_fact:
+        kernel_update_required: >-
+          {{
+            kernel_meta_update_required_result.stdout | default('no') | trim == 'yes'
+            or (apt_upgrade_names.stdout_lines | default([])
+                | select('match', '^linux-(image|modules|headers)')
+                | list | length > 0)
+          }}
+
+    # ============================================================
+    # PHASE 5 - DISCOVER SNAP SOFTWARE + INTERNET CANDIDATES
+    # ============================================================
+
+    - name: Discover installed Snap packages
+      ansible.builtin.shell: |
+        if command -v snap >/dev/null 2>&1; then
+          snap list 2>/dev/null | awk 'NR > 1 {print $1 "\t" $2 "\t" $3}'
+        fi
+      args:
+        executable: /bin/bash
+      register: snap_installed_inventory
+      changed_when: false
+      failed_when: false
+
+    - name: Query Snap refresh candidates from Internet
+      ansible.builtin.shell: |
+        if command -v snap >/dev/null 2>&1; then
+          snap refresh --list 2>/dev/null || true
+        fi
+      args:
+        executable: /bin/bash
+      register: snap_updates_result
+      changed_when: false
+      failed_when: false
+
+    - name: Set Snap upgrade inventory
+      ansible.builtin.set_fact:
+        snap_updates_before: "{{ snap_updates_result.stdout_lines | default([]) }}"
+
+    # ============================================================
+    # PHASE 6 - COMMON EXTERNAL SOFTWARE DISCOVERY
+    # ============================================================
+
+    - name: Discover common externally managed software
+      ansible.builtin.shell: |
+        set +e
+        report() {
+          name="$1"; cmd="$2"
+          path="$(command -v "$cmd" 2>/dev/null || true)"
+          if [ -n "$path" ]; then
+            version="$("$cmd" --version 2>/dev/null | head -n 1)"
+            [ -z "$version" ] && version="$("$cmd" version 2>/dev/null | head -n 1)"
+            printf '%s\t%s\t%s\t%s\n' "$name" "$cmd" "$version" "$path"
+          fi
+        }
+
+        report "gitlab-runner" "gitlab-runner"
+        report "docker" "docker"
+        report "containerd" "containerd"
+        report "kubectl" "kubectl"
+        report "helm" "helm"
+        report "terraform" "terraform"
+        report "ansible" "ansible"
+        report "ollama" "ollama"
+        report "node" "node"
+        report "npm" "npm"
+        report "python3" "python3"
+        report "pip3" "pip3"
+      args:
+        executable: /bin/bash
+      register: external_software_result
+      changed_when: false
+      failed_when: false
+
+    - name: Set external software inventory
+      ansible.builtin.set_fact:
+        external_software_inventory: "{{ external_software_result.stdout_lines | default([]) }}"
+
+    # ============================================================
+    # PHASE 7 - UPDATE ALL APT SOFTWARE
+    # ============================================================
+
+    - name: Upgrade all APT-managed installed software
+      ansible.builtin.apt:
+        upgrade: dist
+        update_cache: false
+        force_apt_get: true
+        autoremove: false
+      register: apt_dist_upgrade
+      when:
+        - update_packages
+        - apt_update_ok or (apt_update_after_repair.rc | default(1) == 0)
+
+    # Explicitly install/upgrade the detected kernel meta-package.
+    # This is what keeps the kernel stream following Ubuntu's repository.
+    - name: Upgrade installed kernel meta-package
+      ansible.builtin.apt:
+        name: "{{ kernel_meta_package }}"
+        state: latest
+        update_cache: false
+        force_apt_get: true
+      register: kernel_meta_upgrade
+      when:
+        - update_packages
+        - update_kernel
+        - kernel_meta_package | length > 0
+        - kernel_update_required
+
+    # If no meta-package exists, install the appropriate Ubuntu 24.04 HWE
+    # meta-package only when the host is explicitly detected as Ubuntu 24.04.
+    - name: Install Ubuntu 24.04 HWE kernel meta-package when no kernel meta exists
+      ansible.builtin.apt:
+        name: linux-image-generic-hwe-24.04
+        state: latest
+        update_cache: false
+        force_apt_get: true
+      register: hwe_kernel_install
+      when:
+        - update_packages
+        - update_kernel
+        - ansible_facts.distribution == "Ubuntu"
+        - ansible_facts.distribution_version == "24.04"
+        - kernel_meta_package | length == 0
+        - kernel_update_required
+
+    # ============================================================
+    # PHASE 8 - UPDATE SNAP
+    # ============================================================
+
+    - name: Refresh all Snap applications
+      ansible.builtin.command: snap refresh
+      register: snap_refresh
+      changed_when: true
+      failed_when: false
+      when:
+        - update_packages
+        - update_snap
+        - snap_updates_before | length > 0
+
+    # ============================================================
+    # PHASE 9 - POST-UPDATE INTERNET VERSION SCAN
+    # ============================================================
+
+    - name: Refresh APT metadata after updates
+      ansible.builtin.command:
+        argv:
+          - apt-get
+          - update
+          - -o
+          - Acquire::Retries=3
+          - -o
+          - APT::Update::Error-Mode=any
+      register: apt_final_update
+      changed_when: false
+      failed_when: false
+      when: update_packages
+
+    - name: Re-scan APT for remaining updates
+      ansible.builtin.shell: |
+        apt list --upgradable 2>/dev/null |
+        awk 'NR > 1 && $1 !~ /^Listing/ {
+          pkg=$1
+          sub(/\/.*/, "", pkg)
+          print pkg "\t" $2
+        }' |
+        sort -u
+      args:
+        executable: /bin/bash
+      register: apt_updates_after_result
+      changed_when: false
+      failed_when: false
+
+    - name: Re-scan Snap for remaining updates
+      ansible.builtin.shell: |
+        if command -v snap >/dev/null 2>&1; then
+          snap refresh --list 2>/dev/null || true
+        fi
+      args:
+        executable: /bin/bash
+      register: snap_updates_after_result
+      changed_when: false
+      failed_when: false
+
+    - name: Detect running kernel after package update
+      ansible.builtin.command: uname -r
+      register: kernel_running_after_result
+      changed_when: false
+
+    - name: Refresh installed kernel images after update
+      ansible.builtin.shell: |
+        find /boot -maxdepth 1 -type f -name 'vmlinuz-*' -printf '%f\n' 2>/dev/null |
+        sed 's/^vmlinuz-//' |
+        sort -V
+      args:
+        executable: /bin/bash
+      register: kernel_images_after_result
+      changed_when: false
+      failed_when: false
+
+    - name: Set post-update kernel facts
+      ansible.builtin.set_fact:
+        kernel_running_after: "{{ kernel_running_after_result.stdout | trim }}"
+        installed_kernel_images_after: "{{ kernel_images_after_result.stdout_lines | default([]) }}"
+        newest_installed_kernel_after: >-
+          {{ kernel_images_after_result.stdout_lines | default([]) | last | default('') }}
+        apt_updates_after: "{{ apt_updates_after_result.stdout_lines | default([]) }}"
+        snap_updates_after: "{{ snap_updates_after_result.stdout_lines | default([]) }}"
+
+    - name: Determine reboot requirement
+      ansible.builtin.set_fact:
+        reboot_required: >-
+          {{
+            (
+              kernel_running_before != newest_installed_kernel_after
+              and newest_installed_kernel_after | length > 0
+            )
+            or
+            (
+              ansible_facts.reboot_required | default(false) | bool
+            )
+            or
+            (
+              lookup('ansible.builtin.pipe', 'test -f /var/run/reboot-required && echo yes || echo no')
+              | trim == 'yes'
+            )
+          }}
+
+    # ============================================================
+    # PHASE 10 - OPTIONAL REBOOT
+    # ============================================================
+
+    - name: Reboot after successful kernel update
+      ansible.builtin.reboot:
+        msg: "Enterprise lifecycle v17 kernel update reboot"
+        reboot_timeout: 900
+        connect_timeout: 10
+        pre_reboot_delay: 5
+        post_reboot_delay: 20
+      when:
+        - reboot_after_kernel_update
+        - reboot_required
+        - newest_installed_kernel_after | length > 0
+
+    - name: Verify kernel after optional reboot
+      ansible.builtin.command: uname -r
+      register: kernel_final
+      changed_when: false
+      failed_when: false
+
+    # ============================================================
+    # PHASE 11 - FINAL HEALTH VERIFICATION
+    # ============================================================
+
+    - name: Final dpkg audit
+      ansible.builtin.command: dpkg --audit
+      register: dpkg_audit_final
+      changed_when: false
+      failed_when: false
+
+    - name: Final APT dependency check
+      ansible.builtin.command: apt-get check
+      register: apt_check_final
+      changed_when: false
+      failed_when: false
+
+    - name: Count remaining APT updates
+      ansible.builtin.shell: |
+        apt list --upgradable 2>/dev/null |
+        awk 'NR > 1 && $1 !~ /^Listing/ {count++} END {print count+0}'
+      register: remaining_apt_count
+      changed_when: false
+      failed_when: false
+
+    # ============================================================
+    # PHASE 12 - REPORT
+    # ============================================================
+
+    - name: Create report directory
+      ansible.builtin.file:
+        path: "{{ report_dir }}"
+        state: directory
+        owner: root
+        group: root
+        mode: "0750"
+
+    - name: Write enterprise software lifecycle JSON report
+      ansible.builtin.copy:
+        dest: "{{ report_file }}"
+        owner: root
+        group: root
+        mode: "0640"
+        content: |
+          {
+            "framework": "Enterprise Linux Software and Kernel Lifecycle v17",
+            "timestamp_utc": {{ ansible_date_time.iso8601 | to_json }},
+            "host": {{ inventory_hostname | to_json }},
+            "os": {{ (ansible_facts.distribution ~ " " ~ ansible_facts.distribution_version) | to_json }},
+            "architecture": {{ ansible_facts.architecture | to_json }},
+
+            "repositories": {
+              "configured_sources": {{ apt_sources.stdout_lines | default([]) | to_json }},
+              "apt_update_rc": {{ apt_update_result.rc | default(99) }},
+              "failed_source_hints": {{ failed_apt_sources | default([]) | to_json }}
+            },
+
+            "apt": {
+              "installed_package_count": {{ apt_installed_inventory.stdout_lines | default([]) | length }},
+              "updates_before": {{ apt_updates_before | to_json }},
+              "updates_after": {{ apt_updates_after | to_json }},
+              "remaining_update_count": {{ apt_updates_after | length }},
+              "dist_upgrade_changed": {{ apt_dist_upgrade.changed | default(false) | to_json }}
+            },
+
+            "snap": {
+              "installed": {{ snap_installed_inventory.stdout_lines | default([]) | to_json }},
+              "updates_before": {{ snap_updates_before | to_json }},
+              "updates_after": {{ snap_updates_after | to_json }}
+            },
+
+            "kernel": {
+              "track": {{ kernel_track | to_json }},
+              "meta_package": {{ kernel_meta_package | to_json }},
+              "meta_candidate": {{ kernel_candidate | to_json }},
+              "update_required": {{ kernel_update_required | to_json }},
+              "running_before": {{ kernel_running_before | to_json }},
+              "running_after": {{ kernel_running_after | to_json }},
+              "newest_installed": {{ newest_installed_kernel_after | to_json }},
+              "installed_images": {{ installed_kernel_images_after | default([]) | to_json }},
+              "reboot_required": {{ reboot_required | to_json }}
+            },
+
+            "external_software": {{ external_software_inventory | to_json }},
+
+            "health": {
+              "dpkg_audit_before_rc": {{ dpkg_audit_before.rc | default(99) }},
+              "dpkg_audit_final_rc": {{ dpkg_audit_final.rc | default(99) }},
+              "apt_check_rc": {{ apt_check_final.rc | default(99) }},
+              "apt_update_final_rc": {{ apt_final_update.rc | default(99) }},
+              "package_manager_healthy": {{
+                (dpkg_audit_final.rc | default(99) == 0 and apt_check_final.rc | default(99) == 0) | to_json
+              }}
+            }
+          }}
+
+    - name: Display lifecycle summary
+      ansible.builtin.debug:
+        msg:
+          - "============================================================"
+          - "ENTERPRISE SOFTWARE + KERNEL LIFECYCLE v17"
+          - "============================================================"
+          - "Host: {{ inventory_hostname }}"
+          - "OS: {{ ansible_facts.distribution }} {{ ansible_facts.distribution_version }}"
+          - "APT packages discovered: {{ apt_installed_inventory.stdout_lines | default([]) | length }}"
+          - "APT updates before: {{ apt_updates_before | length }}"
+          - "APT updates remaining: {{ apt_updates_after | length }}"
+          - "Snap updates before: {{ snap_updates_before | length }}"
+          - "Snap updates remaining: {{ snap_updates_after | length }}"
+          - "Kernel track: {{ kernel_track }}"
+          - "Kernel meta-package: {{ kernel_meta_package | default('not detected') }}"
+          - "Kernel candidate: {{ kernel_candidate | default('unknown') }}"
+          - "Kernel running before: {{ kernel_running_before }}"
+          - "Newest installed kernel: {{ newest_installed_kernel_after }}"
+          - "Kernel running after: {{ kernel_running_after }}"
+          - "Reboot required: {{ reboot_required }}"
+          - "DPKG audit: {{ 'PASS' if dpkg_audit_final.rc | default(1) == 0 else 'FAIL' }}"
+          - "APT check: {{ 'PASS' if apt_check_final.rc | default(1) == 0 else 'FAIL' }}"
+          - "Report: {{ report_file }}"
+          - "============================================================"
