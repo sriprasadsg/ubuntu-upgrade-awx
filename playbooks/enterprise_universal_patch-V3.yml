@@ -1,0 +1,707 @@
+---
+# Enterprise Universal Software Patching
+# Ubuntu/Debian-family hosts
+#
+# Design principles:
+#   - Update software through its existing/authoritative package manager.
+#   - Do not blindly replace unmanaged binaries with arbitrary Internet downloads.
+#   - Do not perform major OS release upgrades.
+#   - Protect the currently running kernel.
+#   - Report unmanaged software rather than guessing its update source.
+#   - Suitable for AWX/Ansible execution with privilege escalation.
+
+- name: Enterprise Universal Software Patching
+  hosts: all
+  become: true
+  gather_facts: true
+
+  vars:
+    # ---------------------------
+    # Master switches
+    # ---------------------------
+    patch_apt: true
+    patch_snap: true
+    patch_python: true
+    patch_npm: true
+    patch_nodejs: true
+    patch_docker_engine: true
+    patch_docker_images: true
+
+    include_phased_updates: true
+    repair_dpkg: true
+    cleanup_unused_packages: true
+    cleanup_old_kernels: true
+    clean_apt_cache: true
+
+    reboot_if_required: true
+    reboot_timeout: 900
+    reboot_post_delay: 20
+
+    # ---------------------------
+    # Python
+    # ---------------------------
+    pip_executable: pip3
+    pip_break_system_packages: false
+
+    # ---------------------------
+    # Node.js / NVM
+    # ---------------------------
+    nodejs_update_nvm: false
+    nodejs_allow_major_upgrade: false
+
+    # ---------------------------
+    # Docker
+    # ---------------------------
+    docker_update_engine: true
+    docker_pull_images: true
+    docker_prune_images: false
+    docker_prune_containers: false
+    docker_prune_volumes: false
+
+    # Do not automatically recreate containers after pulling images.
+    # Recreating containers can cause application downtime and data loss.
+    docker_recreate_containers: false
+
+    # Known Docker Engine package names. Detection below determines which
+    # packages are actually installed before updating them.
+    docker_engine_packages:
+      - docker-ce
+      - docker-ce-cli
+      - containerd.io
+      - docker-buildx-plugin
+      - docker-compose-plugin
+      - docker.io
+      - docker-compose-v2
+
+    # ---------------------------
+    # Optional explicit removals
+    # ---------------------------
+    unwanted_packages: []
+    unwanted_services: []
+
+    # ---------------------------
+    # Optional packages useful on managed hosts
+    # ---------------------------
+    install_security_utilities: false
+    security_utilities:
+      - unattended-upgrades
+      - apt-listchanges
+
+    # ---------------------------
+    # Unmanaged software locations to inventory
+    # ---------------------------
+    manual_software_paths:
+      - /usr/local/bin
+      - /usr/local/sbin
+      - /opt
+
+    # Package-manager commands are intentionally explicit so that the playbook
+    # never tries to guess an arbitrary vendor download URL.
+    apt_env:
+      DEBIAN_FRONTEND: noninteractive
+      NEEDRESTART_MODE: a
+
+  pre_tasks:
+    - name: Validate supported operating system family
+      ansible.builtin.assert:
+        that:
+          - ansible_os_family == 'Debian'
+        fail_msg: >-
+          This playbook currently supports Debian-family operating systems
+          (Ubuntu/Debian). Detected: {{ ansible_os_family }} / {{ ansible_distribution }}.
+
+    - name: Display host and OS information
+      ansible.builtin.debug:
+        msg:
+          - "Host: {{ inventory_hostname }}"
+          - "OS: {{ ansible_distribution }} {{ ansible_distribution_version }}"
+          - "Kernel: {{ ansible_kernel }}"
+          - "Architecture: {{ ansible_architecture }}"
+
+    - name: Configure phased APT updates
+      ansible.builtin.copy:
+        dest: /etc/apt/apt.conf.d/99enterprise-phased-updates
+        owner: root
+        group: root
+        mode: '0644'
+        content: |
+          APT::Get::Always-Include-Phased-Updates "true";
+      when:
+        - patch_apt | bool
+        - include_phased_updates | bool
+
+  tasks:
+    # ================================================================
+    # APT / DPKG
+    # ================================================================
+    - name: Check dpkg status before patching
+      ansible.builtin.command: dpkg --audit
+      register: dpkg_audit_before
+      changed_when: false
+      failed_when: false
+      when: patch_apt | bool
+
+    - name: Repair interrupted dpkg configuration
+      ansible.builtin.command: dpkg --configure -a
+      environment: "{{ apt_env }}"
+      register: dpkg_configure
+      changed_when: dpkg_configure.rc == 0
+      failed_when: false
+      when:
+        - patch_apt | bool
+        - repair_dpkg | bool
+
+    - name: Repair broken APT dependencies
+      ansible.builtin.command: apt-get -f install -y
+      environment: "{{ apt_env }}"
+      register: apt_fix
+      changed_when: apt_fix.rc == 0 and ('0 upgraded' not in apt_fix.stdout | default(''))
+      failed_when: false
+      when: patch_apt | bool
+
+    - name: Detect held APT packages
+      ansible.builtin.shell: |
+        set -o pipefail
+        apt-mark showhold
+      args:
+        executable: /bin/bash
+      register: apt_held
+      changed_when: false
+      failed_when: false
+      when: patch_apt | bool
+
+    - name: Show held APT packages
+      ansible.builtin.debug:
+        msg: "Held packages (not automatically changed): {{ apt_held.stdout_lines | default([]) }}"
+      when: patch_apt | bool
+
+    - name: Refresh APT package metadata
+      ansible.builtin.apt:
+        update_cache: true
+        cache_valid_time: 0
+      environment: "{{ apt_env }}"
+      register: apt_update
+      when: patch_apt | bool
+
+    - name: Inventory installed APT packages
+      ansible.builtin.shell: |
+        dpkg-query -W -f='${binary:Package}\t${Version}\t${Status}\n' \
+        | awk '$3 == "ok" && $4 == "installed" {print $1 "\t" $2}'
+      args:
+        executable: /bin/bash
+      register: apt_inventory
+      changed_when: false
+      failed_when: false
+      when: patch_apt | bool
+
+    - name: Inventory APT packages with available upgrades
+      ansible.builtin.shell: |
+        apt list --upgradable 2>/dev/null || true
+      args:
+        executable: /bin/bash
+      register: apt_upgradable
+      changed_when: false
+      failed_when: false
+      when: patch_apt | bool
+
+    - name: Upgrade all available APT packages
+      ansible.builtin.apt:
+        upgrade: dist
+        update_cache: false
+        autoremove: false
+        autoclean: false
+      environment: "{{ apt_env }}"
+      register: apt_upgrade
+      when: patch_apt | bool
+
+    # ================================================================
+    # SNAP
+    # ================================================================
+    - name: Check whether snap is installed
+      ansible.builtin.command: snap version
+      register: snap_check
+      changed_when: false
+      failed_when: false
+      when: patch_snap | bool
+
+    - name: Inventory installed snaps
+      ansible.builtin.command: snap list
+      register: snap_inventory
+      changed_when: false
+      failed_when: false
+      when:
+        - patch_snap | bool
+        - snap_check.rc == 0
+
+    - name: Refresh all installed snaps
+      ansible.builtin.command: snap refresh
+      register: snap_refresh
+      changed_when: snap_refresh.rc == 0 and ('All snaps up to date' not in snap_refresh.stdout | default(''))
+      failed_when: false
+      when:
+        - patch_snap | bool
+        - snap_check.rc == 0
+
+    # ================================================================
+    # PYTHON / PIP
+    # ================================================================
+    - name: Check Python package manager
+      ansible.builtin.command: "{{ pip_executable }} --version"
+      register: pip_check
+      changed_when: false
+      failed_when: false
+      when: patch_python | bool
+
+    - name: Inventory Python packages
+      ansible.builtin.command:
+        cmd: "{{ pip_executable }} list --format=json"
+      register: pip_inventory
+      changed_when: false
+      failed_when: false
+      when:
+        - patch_python | bool
+        - pip_check.rc == 0
+
+    - name: Detect outdated Python packages
+      ansible.builtin.command:
+        cmd: "{{ pip_executable }} list --outdated --format=json"
+      register: pip_outdated
+      changed_when: false
+      failed_when: false
+      when:
+        - patch_python | bool
+        - pip_check.rc == 0
+
+    - name: Upgrade outdated Python packages
+      ansible.builtin.shell: >-
+        {{ pip_executable }} install --upgrade
+        {% if pip_break_system_packages | bool %}--break-system-packages{% endif %}
+        {{ item.name | quote }}
+      args:
+        executable: /bin/bash
+      loop: "{{ (pip_outdated.stdout | default('[]') | from_json) if (pip_outdated.rc | default(1)) == 0 else [] }}"
+      loop_control:
+        label: "{{ item.name }} -> {{ item.latest_version }}"
+      register: pip_upgrade
+      failed_when: false
+      when:
+        - patch_python | bool
+        - pip_check.rc == 0
+        - pip_break_system_packages | bool or ansible_distribution_version is version('24.04', '<')
+
+    - name: Report Python packages blocked by externally managed environment
+      ansible.builtin.debug:
+        msg: >-
+          Python package upgrades were inventoried but not automatically forced because
+          pip_break_system_packages=false. Use a virtual environment or explicitly set
+          pip_break_system_packages=true only when appropriate.
+      when:
+        - patch_python | bool
+        - pip_check.rc == 0
+        - not pip_break_system_packages | bool
+
+    # ================================================================
+    # NODE.JS / NPM
+    # ================================================================
+    - name: Detect system Node.js
+      ansible.builtin.command: node --version
+      register: node_system_version
+      changed_when: false
+      failed_when: false
+      when: patch_nodejs | bool
+
+    - name: Detect APT-managed Node.js package
+      ansible.builtin.shell: |
+        dpkg-query -W -f='${Status}' nodejs 2>/dev/null | grep -q 'install ok installed'
+      args:
+        executable: /bin/bash
+      register: nodejs_apt_installed
+      changed_when: false
+      failed_when: false
+      when: patch_nodejs | bool
+
+    - name: Update APT-managed Node.js package
+      ansible.builtin.apt:
+        name: nodejs
+        state: latest
+        update_cache: false
+      environment: "{{ apt_env }}"
+      register: nodejs_apt_upgrade
+      failed_when: false
+      when:
+        - patch_nodejs | bool
+        - nodejs_apt_installed.rc == 0
+
+    - name: Detect NVM installation directories
+      ansible.builtin.shell: |
+        set -o pipefail
+        find /home /root -maxdepth 4 -type f -path '*/.nvm/nvm.sh' -print 2>/dev/null
+      args:
+        executable: /bin/bash
+      register: nvm_files
+      changed_when: false
+      failed_when: false
+      when: patch_nodejs | bool
+
+    - name: Report detected Node.js/NVM information
+      ansible.builtin.debug:
+        msg:
+          - "System Node.js: {{ node_system_version.stdout | default('not installed') }}"
+          - "NVM installations: {{ nvm_files.stdout_lines | default([]) }}"
+      when: patch_nodejs | bool
+
+    - name: Update NVM Node.js installations when explicitly enabled
+      ansible.builtin.shell: |
+        set -e
+        export NVM_DIR="$(dirname "{{ item }}")"
+        . "{{ item }}"
+        current_major="$(node --version 2>/dev/null | sed 's/^v//' | cut -d. -f1 || true)"
+        if [ -z "$current_major" ]; then
+          exit 0
+        fi
+        {% if nodejs_allow_major_upgrade | bool %}
+        nvm install --lts
+        nvm alias default 'lts/*'
+        {% else %}
+        nvm install "$current_major"
+        nvm alias default "$current_major"
+        {% endif %}
+      args:
+        executable: /bin/bash
+      loop: "{{ nvm_files.stdout_lines | default([]) }}"
+      loop_control:
+        label: "{{ item }}"
+      register: nvm_upgrade
+      failed_when: false
+      when:
+        - patch_nodejs | bool
+        - nodejs_update_nvm | bool
+        - nvm_files.rc == 0
+
+    - name: Check npm
+      ansible.builtin.command: npm --version
+      register: npm_check
+      changed_when: false
+      failed_when: false
+      when: patch_npm | bool
+
+    - name: Inventory global npm packages
+      ansible.builtin.command:
+        cmd: npm list --global --depth=0 --json
+      register: npm_inventory
+      changed_when: false
+      failed_when: false
+      when:
+        - patch_npm | bool
+        - npm_check.rc == 0
+
+    - name: Detect outdated global npm packages
+      ansible.builtin.command:
+        cmd: npm outdated --global --json
+      register: npm_outdated
+      changed_when: false
+      failed_when: false
+      when:
+        - patch_npm | bool
+        - npm_check.rc == 0
+
+    - name: Upgrade all outdated global npm packages
+      ansible.builtin.command:
+        cmd: npm update --global
+      register: npm_upgrade
+      failed_when: false
+      when:
+        - patch_npm | bool
+        - npm_check.rc == 0
+
+    # ================================================================
+    # DOCKER ENGINE
+    # ================================================================
+    - name: Check Docker CLI
+      ansible.builtin.command: docker --version
+      register: docker_check
+      changed_when: false
+      failed_when: false
+      when: patch_docker_engine | bool or patch_docker_images | bool
+
+    - name: Inventory installed Docker packages
+      ansible.builtin.shell: |
+        dpkg-query -W -f='${binary:Package}\t${Version}\t${Status}\n' \
+        {% for pkg in docker_engine_packages %}'{{ pkg }}' {% endfor %} 2>/dev/null || true
+      args:
+        executable: /bin/bash
+      register: docker_package_inventory_raw
+      changed_when: false
+      failed_when: false
+      when: patch_docker_engine | bool
+
+    - name: Determine installed Docker package names
+      ansible.builtin.shell: |
+        for p in {{ docker_engine_packages | map('quote') | join(' ') }}; do
+          if dpkg-query -W -f='${Status}' "$p" 2>/dev/null | grep -q 'install ok installed'; then
+            printf '%s\n' "$p"
+          fi
+        done
+      args:
+        executable: /bin/bash
+      register: docker_installed_packages
+      changed_when: false
+      failed_when: false
+      when: patch_docker_engine | bool
+
+    - name: Update installed Docker Engine packages through configured APT repositories
+      ansible.builtin.apt:
+        name: "{{ docker_installed_packages.stdout_lines | default([]) }}"
+        state: latest
+        update_cache: false
+      environment: "{{ apt_env }}"
+      register: docker_engine_upgrade
+      failed_when: false
+      when:
+        - patch_docker_engine | bool
+        - docker_installed_packages.stdout_lines | default([]) | length > 0
+
+    - name: Inventory Docker images
+      ansible.builtin.shell: |
+        docker image ls --format '{{ '{{' }}.Repository{{ '}}' }}:{{ '{{' }}.Tag{{ '}}' }}\t{{ '{{' }}.ID{{ '}}' }}\t{{ '{{' }}.CreatedAt{{ '}}' }}' 2>/dev/null || true
+      args:
+        executable: /bin/bash
+      register: docker_image_inventory
+      changed_when: false
+      failed_when: false
+      when:
+        - patch_docker_images | bool
+        - docker_check.rc == 0
+
+    - name: Pull configured Docker images by their existing tags
+      ansible.builtin.shell: |
+        set -o pipefail
+        docker image ls --format '{{ '{{' }}.Repository{{ '}}' }}:{{ '{{' }}.Tag{{ '}}' }}' \
+        | grep -v '^<none>:' \
+        | while IFS= read -r image; do
+            [ -n "$image" ] || continue
+            docker pull "$image" || true
+          done
+      args:
+        executable: /bin/bash
+      register: docker_image_pull
+      changed_when: false
+      failed_when: false
+      when:
+        - patch_docker_images | bool
+        - docker_check.rc == 0
+
+    - name: Prune unused Docker images when explicitly enabled
+      ansible.builtin.command: docker image prune -af
+      register: docker_image_prune
+      changed_when: docker_image_prune.rc == 0
+      failed_when: false
+      when:
+        - patch_docker_images | bool
+        - docker_prune_images | bool
+        - docker_check.rc == 0
+
+    - name: Prune stopped Docker containers when explicitly enabled
+      ansible.builtin.command: docker container prune -f
+      register: docker_container_prune
+      changed_when: docker_container_prune.rc == 0
+      failed_when: false
+      when:
+        - patch_docker_images | bool
+        - docker_prune_containers | bool
+        - docker_check.rc == 0
+
+    - name: Prune unused Docker volumes when explicitly enabled
+      ansible.builtin.command: docker volume prune -f
+      register: docker_volume_prune
+      changed_when: docker_volume_prune.rc == 0
+      failed_when: false
+      when:
+        - patch_docker_images | bool
+        - docker_prune_volumes | bool
+        - docker_check.rc == 0
+
+    # ================================================================
+    # EXPLICIT PACKAGE/SERVICE REMOVAL
+    # ================================================================
+    - name: Remove explicitly configured unwanted packages
+      ansible.builtin.apt:
+        name: "{{ unwanted_packages }}"
+        state: absent
+        purge: true
+        autoremove: false
+      environment: "{{ apt_env }}"
+      when:
+        - unwanted_packages | length > 0
+
+    - name: Stop and disable explicitly configured unwanted services
+      ansible.builtin.service:
+        name: "{{ item }}"
+        state: stopped
+        enabled: false
+      loop: "{{ unwanted_services }}"
+      failed_when: false
+      when: unwanted_services | length > 0
+
+    # ================================================================
+    # KERNELS
+    # ================================================================
+    - name: Record currently running kernel
+      ansible.builtin.command: uname -r
+      register: running_kernel
+      changed_when: false
+
+    - name: Inventory installed Linux kernel packages
+      ansible.builtin.shell: |
+        dpkg-query -W -f='${binary:Package}\t${Version}\t${Status}\n' 'linux-image*' 'linux-headers*' 2>/dev/null || true
+      args:
+        executable: /bin/bash
+      register: kernel_inventory
+      changed_when: false
+      failed_when: false
+
+    - name: Show running kernel and installed kernel packages
+      ansible.builtin.debug:
+        msg:
+          - "Running kernel: {{ running_kernel.stdout }}"
+          - "Installed kernel packages: {{ kernel_inventory.stdout_lines | default([]) }}"
+
+    - name: Update initramfs for all installed kernels
+      ansible.builtin.command: update-initramfs -u -k all
+      register: initramfs_update
+      changed_when: initramfs_update.rc == 0
+      failed_when: false
+      when: patch_apt | bool
+
+    - name: Update GRUB configuration
+      ansible.builtin.command: update-grub
+      register: grub_update
+      changed_when: grub_update.rc == 0
+      failed_when: false
+      when: patch_apt | bool
+
+    - name: Autoremove unused packages and obsolete kernels
+      ansible.builtin.apt:
+        autoremove: true
+        purge: true
+        autoclean: true
+      environment: "{{ apt_env }}"
+      register: apt_autoremove
+      failed_when: false
+      when:
+        - patch_apt | bool
+        - cleanup_unused_packages | bool or cleanup_old_kernels | bool
+
+    - name: Clean APT cache
+      ansible.builtin.apt:
+        autoclean: true
+      environment: "{{ apt_env }}"
+      register: apt_autoclean
+      failed_when: false
+      when:
+        - patch_apt | bool
+        - clean_apt_cache | bool
+
+    # ================================================================
+    # SECURITY UTILITIES
+    # ================================================================
+    - name: Install optional security utilities
+      ansible.builtin.apt:
+        name: "{{ security_utilities }}"
+        state: present
+        update_cache: false
+      environment: "{{ apt_env }}"
+      when:
+        - install_security_utilities | bool
+        - security_utilities | length > 0
+
+    # ================================================================
+    # UNMANAGED SOFTWARE INVENTORY
+    # ================================================================
+    - name: Check unmanaged software locations
+      ansible.builtin.stat:
+        path: "{{ item }}"
+      loop: "{{ manual_software_paths }}"
+      register: manual_paths
+      changed_when: false
+
+    - name: Inventory executable files in unmanaged locations
+      ansible.builtin.shell: |
+        set -o pipefail
+        for p in {{ manual_software_paths | map('quote') | join(' ') }}; do
+          if [ -d "$p" ]; then
+            find "$p" -maxdepth 3 -type f -perm /111 -printf '%p\t%TY-%Tm-%Td %TH:%TM:%TS\n' 2>/dev/null || true
+          fi
+        done
+      args:
+        executable: /bin/bash
+      register: unmanaged_software
+      changed_when: false
+      failed_when: false
+
+    - name: Report unmanaged software for manual/vendor-specific review
+      ansible.builtin.debug:
+        msg: >-
+          Executables found outside normal package-manager paths. These are inventoried
+          only; no arbitrary Internet binary replacement is attempted:
+          {{ unmanaged_software.stdout_lines | default([]) }}
+
+    # ================================================================
+    # FINAL HEALTH CHECKS
+    # ================================================================
+    - name: Check dpkg health after patching
+      ansible.builtin.command: dpkg --audit
+      register: dpkg_audit_after
+      changed_when: false
+      failed_when: false
+
+    - name: Check APT dependency health after patching
+      ansible.builtin.command: apt-get check
+      environment: "{{ apt_env }}"
+      register: apt_check_after
+      changed_when: false
+      failed_when: false
+
+    - name: Check reboot requirement
+      ansible.builtin.stat:
+        path: /var/run/reboot-required
+      register: reboot_required_file
+
+    - name: Display final package and kernel information
+      ansible.builtin.shell: |
+        echo "OS: {{ ansible_distribution }} {{ ansible_distribution_version }}"
+        echo "Kernel: $(uname -r)"
+        echo "Node.js: $(node --version 2>/dev/null || echo 'not installed')"
+        echo "npm: $(npm --version 2>/dev/null || echo 'not installed')"
+        echo "Docker: $(docker --version 2>/dev/null || echo 'not installed')"
+        echo "Python: $(python3 --version 2>/dev/null || echo 'not installed')"
+        echo "pip: $({{ pip_executable }} --version 2>/dev/null || echo 'not installed')"
+      args:
+        executable: /bin/bash
+      register: final_versions
+      changed_when: false
+      failed_when: false
+
+    - name: Show final versions
+      ansible.builtin.debug:
+        var: final_versions.stdout_lines
+
+    - name: Show patch health summary
+      ansible.builtin.debug:
+        msg:
+          - "dpkg audit before: {{ dpkg_audit_before.stdout_lines | default([]) }}"
+          - "dpkg audit after: {{ dpkg_audit_after.stdout_lines | default([]) }}"
+          - "APT check: {{ apt_check_after.stdout | default('not executed') }}"
+          - "Reboot required: {{ reboot_required_file.stat.exists | default(false) }}"
+
+    # ================================================================
+    # REBOOT
+    # ================================================================
+    - name: Reboot host when required
+      ansible.builtin.reboot:
+        reboot_timeout: "{{ reboot_timeout }}"
+        post_reboot_delay: "{{ reboot_post_delay }}"
+        test_command: whoami
+      when:
+        - reboot_if_required | bool
+        - reboot_required_file.stat.exists | default(false)
