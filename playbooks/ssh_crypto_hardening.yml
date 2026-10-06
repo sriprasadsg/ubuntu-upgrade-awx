@@ -1,6 +1,6 @@
 ---
 - name: Remediate SSH weak MACs and CBC ciphers
-  hosts: ubuntu_servers
+  hosts: all
   become: true
   gather_facts: true
 
