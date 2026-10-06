@@ -1,0 +1,617 @@
+---
+- name: Automatic Ubuntu Kernel Remediation with One Fallback Kernel
+  hosts: ubuntu_servers
+  become: true
+  gather_facts: true
+  serial: "{{ kernel_remediation_serial | default('100%') }}"
+  any_errors_fatal: false
+
+  vars:
+    # Keep exactly:
+    #   1. The newest installed kernel
+    #   2. The immediately previous installed kernel as fallback
+    #
+    # No kernel version is embedded in this playbook.
+    kernels_to_keep: 2
+
+    # Reboot automatically after a kernel update or when
+    # /var/run/reboot-required exists.
+    automatic_reboot: true
+
+    # Remove older kernel packages after the new kernel is confirmed
+    # as the running kernel.
+    automatic_cleanup: true
+
+  pre_tasks:
+
+    # ================================================================
+    # Validate operating system
+    # ================================================================
+
+    - name: Verify supported Ubuntu release
+      ansible.builtin.assert:
+        that:
+          - ansible_facts.distribution == "Ubuntu"
+          - ansible_facts.distribution_major_version in ['20', '22', '24']
+        fail_msg: >-
+          Unsupported operating system:
+          {{ ansible_facts.distribution }}
+          {{ ansible_facts.distribution_version }}
+
+    - name: Display system information
+      ansible.builtin.debug:
+        msg:
+          - "Host: {{ inventory_hostname }}"
+          - "Ubuntu: {{ ansible_facts.distribution_version }}"
+          - "Architecture: {{ ansible_facts.architecture }}"
+          - "Current running kernel: {{ ansible_facts.kernel }}"
+
+    # ================================================================
+    # Detect the installed kernel meta-package / kernel track
+    # ================================================================
+
+    - name: Detect installed HWE kernel meta-package
+      ansible.builtin.shell: |
+        dpkg-query -W -f='${Package}\t${Status}\n' 2>/dev/null |
+        awk '
+          $1 ~ /^linux-generic-hwe-[0-9]+\.[0-9]+$/ &&
+          $2 == "install" && $3 == "ok" && $4 == "installed" {
+            print $1
+          }
+        ' |
+        sort -V |
+        tail -n 1
+      register: detected_hwe_meta
+      changed_when: false
+
+    - name: Detect installed generic kernel meta-package
+      ansible.builtin.shell: |
+        dpkg-query -W -f='${Package}\t${Status}\n' 2>/dev/null |
+        awk '
+          $1 == "linux-generic" &&
+          $2 == "install" && $3 == "ok" && $4 == "installed" {
+            print $1
+          }
+        '
+      register: detected_generic_meta
+      changed_when: false
+
+    - name: Detect installed cloud kernel meta-packages
+      ansible.builtin.shell: |
+        dpkg-query -W -f='${Package}\t${Status}\n' 2>/dev/null |
+        awk '
+          $1 ~ /^linux-(aws|azure|gcp|kvm|oracle|virtual)$/ &&
+          $2 == "install" && $3 == "ok" && $4 == "installed" {
+            print $1
+          }
+        ' |
+        sort -V |
+        tail -n 1
+      register: detected_cloud_meta
+      changed_when: false
+
+    - name: Select existing kernel track
+      ansible.builtin.set_fact:
+        kernel_meta_package: >-
+          {{
+            detected_hwe_meta.stdout | trim
+            if (detected_hwe_meta.stdout | trim | length > 0)
+            else detected_cloud_meta.stdout | trim
+            if (detected_cloud_meta.stdout | trim | length > 0)
+            else detected_generic_meta.stdout | trim
+            if (detected_generic_meta.stdout | trim | length > 0)
+            else ''
+          }}
+
+    - name: Refuse to switch kernel families when no track is detected
+      ansible.builtin.assert:
+        that:
+          - kernel_meta_package | length > 0
+        fail_msg: >-
+          No installed Ubuntu kernel meta-package was detected.
+          Refusing to switch this server to a different kernel family.
+
+    - name: Display selected kernel track
+      ansible.builtin.debug:
+        msg:
+          - "Detected kernel meta-package: {{ kernel_meta_package }}"
+          - "Current running kernel: {{ ansible_facts.kernel }}"
+
+    - name: Build protected kernel meta-package list
+      ansible.builtin.shell: |
+        dpkg-query -W -f='${Package}\t${Status}\n' 2>/dev/null |
+        awk -v selected="{{ kernel_meta_package }}" '
+          $2 == "install" && $3 == "ok" && $4 == "installed" &&
+          (
+            $1 == selected ||
+            $1 == "linux-generic" ||
+            $1 == "linux-image-generic" ||
+            $1 == "linux-headers-generic" ||
+            $1 == "linux-generic-hwe-20.04" ||
+            $1 == "linux-generic-hwe-22.04" ||
+            $1 == "linux-generic-hwe-24.04" ||
+            $1 == "linux-image-generic-hwe-20.04" ||
+            $1 == "linux-image-generic-hwe-22.04" ||
+            $1 == "linux-image-generic-hwe-24.04" ||
+            $1 == "linux-headers-generic-hwe-20.04" ||
+            $1 == "linux-headers-generic-hwe-22.04" ||
+            $1 == "linux-headers-generic-hwe-24.04"
+          ) {
+            print $1
+          }
+        ' |
+        sort -u
+      register: protected_kernel_meta_packages_cmd
+      changed_when: false
+
+    - name: Set protected kernel meta-packages
+      ansible.builtin.set_fact:
+        protected_kernel_meta_packages: >-
+          {{
+            (
+              protected_kernel_meta_packages_cmd.stdout_lines | default([])
+            )
+            + [kernel_meta_package]
+          }}
+
+    - name: Remove duplicate protected meta-packages
+      ansible.builtin.set_fact:
+        protected_kernel_meta_packages: >-
+          {{ protected_kernel_meta_packages | unique | sort }}
+
+    - name: Display protected kernel meta-packages
+      ansible.builtin.debug:
+        msg:
+          - "Protected kernel meta-package family: {{ protected_kernel_meta_packages }}"
+
+    # ================================================================
+    # Validate APT and refresh repositories
+    # ================================================================
+
+    - name: Verify APT package state
+      ansible.builtin.command:
+        cmd: apt-get check
+      changed_when: false
+
+    - name: Refresh APT repositories
+      ansible.builtin.apt:
+        update_cache: true
+        cache_valid_time: 0
+
+    - name: Get current APT candidate for the detected kernel track
+      ansible.builtin.shell: |
+        apt-cache policy "{{ kernel_meta_package }}" |
+        awk '/Candidate:/ {print $2; exit}'
+      register: kernel_meta_candidate
+      changed_when: false
+
+    - name: Verify kernel candidate exists
+      ansible.builtin.assert:
+        that:
+          - kernel_meta_candidate.stdout | trim != ""
+          - kernel_meta_candidate.stdout | trim != "none"
+        fail_msg: >-
+          No APT candidate found for {{ kernel_meta_package }}.
+          Check Ubuntu repositories and network connectivity.
+
+    - name: Display current APT kernel candidate
+      ansible.builtin.debug:
+        msg:
+          - "Kernel track: {{ kernel_meta_package }}"
+          - "APT candidate: {{ kernel_meta_candidate.stdout | trim }}"
+          - "Current running kernel: {{ ansible_facts.kernel }}"
+
+    - name: Record previous running kernel
+      ansible.builtin.set_fact:
+        previous_kernel: "{{ ansible_facts.kernel }}"
+
+  tasks:
+
+    # ================================================================
+    # Install the latest kernel available from the configured repo
+    # ================================================================
+
+    - name: Install or upgrade the detected kernel meta-package
+      ansible.builtin.apt:
+        name: "{{ kernel_meta_package }}"
+        state: latest
+        install_recommends: true
+      register: kernel_meta_update
+
+    - name: Perform full system upgrade
+      ansible.builtin.apt:
+        upgrade: full
+        autoremove: false
+        autoclean: true
+      register: full_upgrade
+
+    - name: Check whether reboot is required
+      ansible.builtin.stat:
+        path: /var/run/reboot-required
+      register: reboot_required
+
+    - name: Display kernel update status
+      ansible.builtin.debug:
+        msg:
+          - "Kernel meta-package changed: {{ kernel_meta_update.changed }}"
+          - "Full upgrade changed packages: {{ full_upgrade.changed }}"
+          - "Reboot required: {{ reboot_required.stat.exists }}"
+          - "Previous running kernel: {{ previous_kernel }}"
+
+    # ================================================================
+    # Reboot so the newest installed kernel becomes active
+    # ================================================================
+
+    - name: Reboot after kernel update
+      ansible.builtin.reboot:
+        msg: "Rebooting after automatic Ubuntu kernel remediation"
+        connect_timeout: 10
+        reboot_timeout: 1200
+        pre_reboot_delay: 5
+        post_reboot_delay: 30
+        test_command: "uname -r"
+      when:
+        - automatic_reboot | bool
+        - kernel_meta_update.changed or reboot_required.stat.exists
+
+    - name: Gather facts after reboot
+      ansible.builtin.setup:
+
+    - name: Get active kernel after remediation
+      ansible.builtin.command:
+        cmd: uname -r
+      register: current_kernel_after
+      changed_when: false
+
+    - name: Display active kernel
+      ansible.builtin.debug:
+        msg:
+          - "Previous running kernel: {{ previous_kernel }}"
+          - "Current running kernel: {{ current_kernel_after.stdout | trim }}"
+
+    # ================================================================
+    # Identify installed versioned kernel images
+    # ================================================================
+
+    - name: Get installed versioned kernel images
+      ansible.builtin.shell: |
+        dpkg-query -W -f='${Package}\t${Status}\n' 2>/dev/null |
+        awk '
+          $1 ~ /^linux-image-[0-9]/ &&
+          $2 == "install" && $3 == "ok" && $4 == "installed" {
+            sub(/^linux-image-/, "", $1)
+            print $1
+          }
+        ' |
+        sort -V
+      register: installed_kernel_versions
+      changed_when: false
+
+    - name: Verify at least one installed kernel exists
+      ansible.builtin.assert:
+        that:
+          - installed_kernel_versions.stdout_lines | length >= 1
+        fail_msg: "No installed linux-image kernel was detected."
+
+    - name: Display installed kernel versions
+      ansible.builtin.debug:
+        msg:
+          - "Installed kernels sorted oldest-to-newest: {{ installed_kernel_versions.stdout_lines }}"
+          - "Current running kernel: {{ current_kernel_after.stdout | trim }}"
+
+    # ================================================================
+    # Determine latest and fallback kernels dynamically
+    # ================================================================
+
+    # The shell sort -V result is already version ordered. The following
+    # task uses the final two entries from that list, newest first.
+    - name: Set latest and fallback kernels
+      ansible.builtin.set_fact:
+        kernels_sorted_newest_first: "{{ installed_kernel_versions.stdout_lines | reverse | list }}"
+
+    - name: Select latest and fallback kernels
+      ansible.builtin.set_fact:
+        kernels_to_keep_versions: "{{ kernels_sorted_newest_first[:kernels_to_keep] }}"
+
+    - name: Ensure current running kernel is among retained kernels
+      ansible.builtin.assert:
+        that:
+          - (current_kernel_after.stdout | trim) in kernels_to_keep_versions
+        fail_msg: >-
+          The currently running kernel
+          {{ current_kernel_after.stdout | trim }}
+          is not among the two newest installed kernels:
+          {{ kernels_to_keep_versions }}.
+          Refusing to remove any kernel.
+
+    - name: Display dynamic retention decision
+      ansible.builtin.debug:
+        msg:
+          - "Latest installed kernel: {{ kernels_to_keep_versions[0] }}"
+          - "Fallback kernel: {{ kernels_to_keep_versions[1] if kernels_to_keep_versions | length > 1 else 'No fallback kernel available' }}"
+          - "Kernels retained: {{ kernels_to_keep_versions }}"
+          - "Kernels eligible for removal: {{ installed_kernel_versions.stdout_lines | difference(kernels_to_keep_versions) }}"
+
+    - name: Find installed packages belonging to retained kernels
+      ansible.builtin.shell: |
+        dpkg-query -W -f='${Package}\t${Status}\n' 2>/dev/null |
+        awk '
+          $2 == "install" && $3 == "ok" && $4 == "installed" {
+            {% for k in kernels_to_keep_versions %}
+            if (index($1, "-{{ k }}") > 0) {
+              print $1
+            }{{ " else " if not loop.last else "" }}{% endfor %}
+          }
+        ' |
+        sort -u
+      args:
+        executable: /bin/bash
+      register: retained_kernel_packages
+      changed_when: false
+
+    - name: Mark retained kernel packages as manually installed
+      ansible.builtin.command:
+        cmd: apt-mark manual {{ item }}
+      loop: "{{ retained_kernel_packages.stdout_lines }}"
+      changed_when: false
+      when:
+        - retained_kernel_packages.stdout_lines | length > 0
+
+    - name: Mark selected kernel meta-packages as manually installed
+      ansible.builtin.command:
+        cmd: apt-mark manual {{ item }}
+      loop: "{{ protected_kernel_meta_packages }}"
+      changed_when: false
+      when:
+        - protected_kernel_meta_packages | length > 0
+
+    # ================================================================
+    # Identify all installed packages belonging to old kernels
+    # ================================================================
+
+    - name: Determine obsolete kernel versions
+      ansible.builtin.set_fact:
+        obsolete_kernel_versions: >-
+          {{
+            installed_kernel_versions.stdout_lines
+            | difference(kernels_to_keep_versions)
+            | list
+          }}
+
+    - name: Find installed packages belonging to obsolete kernels
+      ansible.builtin.shell: |
+        set -o pipefail
+        dpkg-query -W -f='${Package}\t${Status}\n' 2>/dev/null |
+        awk '
+          $1 ~ /^linux-/ &&
+          $2 == "install" && $3 == "ok" && $4 == "installed" {
+            {% for k in obsolete_kernel_versions %}
+            if (index($1, "-{{ k }}") > 0) {
+              print $1
+            }{{ " else " if not loop.last else "" }}{% endfor %}
+          }
+        ' |
+        sort -u
+      args:
+        executable: /bin/bash
+      register: obsolete_kernel_packages
+      changed_when: false
+      when:
+        - obsolete_kernel_versions | length > 0
+
+    - name: Set empty obsolete package list when no cleanup is needed
+      ansible.builtin.set_fact:
+        obsolete_kernel_packages: []
+      when:
+        - obsolete_kernel_versions | length == 0
+
+    - name: Display obsolete kernel packages
+      ansible.builtin.debug:
+        msg:
+          - "Old kernel versions to remove: {{ obsolete_kernel_versions }}"
+          - "Packages to remove: {{ obsolete_kernel_packages.stdout_lines if obsolete_kernel_packages is mapping else obsolete_kernel_packages }}"
+
+    # ================================================================
+    # Remove everything older than the newest + one fallback
+    # ================================================================
+
+    - name: Remove obsolete kernel packages
+      ansible.builtin.apt:
+        name: "{{ obsolete_kernel_packages.stdout_lines }}"
+        state: absent
+        purge: true
+      when:
+        - automatic_cleanup | bool
+        - obsolete_kernel_packages is mapping
+        - obsolete_kernel_packages.stdout_lines | length > 0
+
+    - name: Find installed kernel meta-packages
+      ansible.builtin.shell: |
+        dpkg-query -W -f='${Package}\t${Status}\n' 2>/dev/null |
+        awk '
+          (
+            $1 == "linux-generic" ||
+            $1 == "linux-image-generic" ||
+            $1 == "linux-headers-generic" ||
+            $1 == "linux-generic-hwe-20.04" ||
+            $1 == "linux-generic-hwe-22.04" ||
+            $1 == "linux-generic-hwe-24.04" ||
+            $1 == "linux-image-generic-hwe-20.04" ||
+            $1 == "linux-image-generic-hwe-22.04" ||
+            $1 == "linux-image-generic-hwe-24.04" ||
+            $1 == "linux-headers-generic-hwe-20.04" ||
+            $1 == "linux-headers-generic-hwe-22.04" ||
+            $1 == "linux-headers-generic-hwe-24.04"
+          ) &&
+          $2 == "install" && $3 == "ok" && $4 == "installed" {
+            print $1
+          }
+        ' |
+        sort -u
+      register: installed_kernel_meta_packages
+      changed_when: false
+
+    - name: Determine conflicting kernel meta-packages
+      ansible.builtin.set_fact:
+        obsolete_meta_packages: >-
+          {{
+            installed_kernel_meta_packages.stdout_lines
+            | difference(protected_kernel_meta_packages)
+            | list
+          }}
+
+    - name: Display conflicting kernel meta-packages
+      ansible.builtin.debug:
+        msg:
+          - "Protected meta-packages: {{ protected_kernel_meta_packages }}"
+          - "Meta-packages to remove: {{ obsolete_meta_packages }}"
+
+    - name: Remove obsolete kernel meta-packages
+      ansible.builtin.apt:
+        name: "{{ obsolete_meta_packages }}"
+        state: absent
+        purge: true
+      when:
+        - automatic_cleanup | bool
+        - obsolete_meta_packages | length > 0
+
+    - name: Remove unused packages
+      ansible.builtin.apt:
+        autoremove: true
+        purge: true
+      when:
+        - automatic_cleanup | bool
+
+    - name: Clean APT cache
+      ansible.builtin.apt:
+        autoclean: true
+      when:
+        - automatic_cleanup | bool
+
+    - name: Update GRUB
+      ansible.builtin.command:
+        cmd: update-grub
+      changed_when: true
+
+    # ================================================================
+    # Final validation
+    # ================================================================
+
+    - name: Get final installed kernel versions
+      ansible.builtin.shell: |
+        dpkg-query -W -f='${Package}\t${Status}\n' 2>/dev/null |
+        awk '
+          $1 ~ /^linux-image-[0-9]/ &&
+          $2 == "install" && $3 == "ok" && $4 == "installed" {
+            sub(/^linux-image-/, "", $1)
+            print $1
+          }
+        ' |
+        sort -V
+      register: final_kernel_versions
+      changed_when: false
+
+    - name: Get final installed kernel meta-packages
+      ansible.builtin.shell: |
+        dpkg-query -W -f='${Package}\t${Version}\t${Status}\n' 2>/dev/null |
+        awk '
+          $1 ~ /^linux-(generic|image-generic|headers-generic|generic-hwe-[0-9]+\.[0-9]+|image-generic-hwe-[0-9]+\.[0-9]+|headers-generic-hwe-[0-9]+\.[0-9]+)$/ &&
+          $3 == "install" && $4 == "ok" && $5 == "installed" {
+            print $1
+          }
+        ' |
+        sort -V
+      register: final_kernel_meta_packages
+      changed_when: false
+
+    - name: Check final reboot requirement
+      ansible.builtin.stat:
+        path: /var/run/reboot-required
+      register: final_reboot_required
+
+    - name: Verify newest two kernels are retained
+      ansible.builtin.assert:
+        that:
+          - >-
+            (
+              final_kernel_versions.stdout_lines
+              | reverse
+              | list
+            )[:kernels_to_keep] == kernels_to_keep_versions
+        fail_msg: >-
+          Kernel retention validation failed.
+          Expected newest kernels to retain:
+          {{ kernels_to_keep_versions }}.
+          Final installed kernels:
+          {{ final_kernel_versions.stdout_lines }}
+
+    - name: Verify no older kernels remain
+      ansible.builtin.assert:
+        that:
+          - >-
+            (
+              final_kernel_versions.stdout_lines
+              | difference(kernels_to_keep_versions)
+              | length
+            ) == 0
+        fail_msg: >-
+          Older kernels remain installed:
+          {{
+            final_kernel_versions.stdout_lines
+            | difference(kernels_to_keep_versions)
+          }}
+
+    - name: Verify selected kernel meta-package family remains installed
+      ansible.builtin.assert:
+        that:
+          - kernel_meta_package in final_kernel_meta_packages.stdout_lines
+          - >-
+            (
+              protected_kernel_meta_packages
+              | difference(final_kernel_meta_packages.stdout_lines)
+              | length
+            ) == 0
+          - >-
+            (
+              final_kernel_meta_packages.stdout_lines
+              | difference(protected_kernel_meta_packages)
+              | length
+            ) == 0
+        fail_msg: >-
+          Kernel meta-package retention validation failed.
+          Protected meta-packages:
+          {{ protected_kernel_meta_packages }}.
+          Final installed meta-packages:
+          {{ final_kernel_meta_packages.stdout_lines }}.
+
+    - name: Verify running kernel is retained
+      ansible.builtin.assert:
+        that:
+          - (current_kernel_after.stdout | trim) in kernels_to_keep_versions
+        fail_msg: >-
+          Current running kernel {{ current_kernel_after.stdout | trim }}
+          is not in the retained kernel list {{ kernels_to_keep_versions }}.
+
+    - name: Verify reboot is no longer pending
+      ansible.builtin.assert:
+        that:
+          - not final_reboot_required.stat.exists
+        fail_msg: "The server still requires a reboot."
+
+  post_tasks:
+
+    - name: Final remediation report
+      ansible.builtin.debug:
+        msg:
+          - "============================================================"
+          - " Ubuntu Kernel Remediation Complete"
+          - "============================================================"
+          - "Host: {{ inventory_hostname }}"
+          - "Ubuntu: {{ ansible_facts.distribution_version }}"
+          - "Kernel track: {{ kernel_meta_package }}"
+          - "Running kernel: {{ current_kernel_after.stdout | trim }}"
+          - "Latest installed kernel: {{ kernels_to_keep_versions[0] }}"
+          - "Fallback kernel: {{ kernels_to_keep_versions[1] if kernels_to_keep_versions | length > 1 else 'None available' }}"
+          - "Kernels retained: {{ kernels_to_keep_versions }}"
+          - "Older kernels removed: {{ obsolete_kernel_versions }}"
+          - "============================================================"
