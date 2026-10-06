@@ -1,0 +1,174 @@
+---
+- name: Remediate SSH weak MACs and CBC ciphers
+  hosts: ubuntu_servers
+  become: true
+  gather_facts: true
+
+  vars:
+    ssh_config: /etc/ssh/sshd_config
+    ssh_dropin_dir: /etc/ssh/sshd_config.d
+    ssh_hardening_file: /etc/ssh/sshd_config.d/99-crypto-hardening.conf
+
+    # MACs permitted by the scanner recommendation
+    ssh_allowed_macs:
+      - hmac-sha2-512
+      - hmac-sha2-512-etm@openssh.com
+      - hmac-sha2-256
+      - hmac-sha2-256-etm@openssh.com
+      - hmac-ripemd160-etm@openssh.com
+      - hmac-ripemd160
+
+    # CTR-mode ciphers only.
+    # ChaCha20 and AES-GCM are also modern alternatives and do not use CBC.
+    ssh_allowed_ciphers:
+      - aes128-ctr
+      - aes192-ctr
+      - aes256-ctr
+      - chacha20-poly1305@openssh.com
+      - aes128-gcm@openssh.com
+      - aes256-gcm@openssh.com
+
+  pre_tasks:
+
+    - name: Verify Ubuntu operating system
+      ansible.builtin.assert:
+        that:
+          - ansible_facts.distribution == "Ubuntu"
+        fail_msg: "This playbook is intended for Ubuntu servers."
+
+    - name: Install required SSH packages
+      ansible.builtin.apt:
+        name:
+          - openssh-server
+          - openssh-client
+        state: present
+        update_cache: true
+        cache_valid_time: 3600
+
+    - name: Ensure SSH configuration directory exists
+      ansible.builtin.file:
+        path: "{{ ssh_dropin_dir }}"
+        state: directory
+        owner: root
+        group: root
+        mode: "0755"
+
+    - name: Check current SSH configuration
+      ansible.builtin.command:
+        cmd: sshd -T
+      register: sshd_current_config
+      changed_when: false
+      check_mode: false
+
+    - name: Display current SSH MAC algorithms
+      ansible.builtin.debug:
+        msg: "{{ sshd_current_config.stdout_lines | select('match', '^macs ') | list }}"
+
+    - name: Display current SSH ciphers
+      ansible.builtin.debug:
+        msg: "{{ sshd_current_config.stdout_lines | select('match', '^ciphers ') | list }}"
+
+  tasks:
+
+    - name: Backup sshd_config
+      ansible.builtin.copy:
+        src: "{{ ssh_config }}"
+        dest: "{{ ssh_config }}.backup-{{ ansible_date_time.iso8601_basic_short }}"
+        remote_src: true
+        owner: root
+        group: root
+        mode: "0600"
+        force: false
+
+    - name: Create SSH crypto hardening configuration
+      ansible.builtin.copy:
+        dest: "{{ ssh_hardening_file }}"
+        owner: root
+        group: root
+        mode: "0644"
+        content: |
+          # SSH cryptographic hardening
+          # Managed by Ansible
+          #
+          # Weak CBC ciphers and weak/96-bit/MD5 MAC algorithms are disabled.
+
+          MACs {{ ssh_allowed_macs | join(',') }}
+
+          Ciphers {{ ssh_allowed_ciphers | join(',') }}
+      notify:
+        - Validate SSH configuration
+        - Restart SSH
+
+    - name: Validate sshd configuration before continuing
+      ansible.builtin.command:
+        cmd: sshd -t
+      changed_when: false
+
+    - name: Verify configured SSH MAC algorithms
+      ansible.builtin.command:
+        cmd: sshd -T
+      register: sshd_final_config
+      changed_when: false
+
+    - name: Extract effective SSH MAC configuration
+      ansible.builtin.set_fact:
+        effective_macs: >-
+          {{
+            sshd_final_config.stdout_lines
+            | select('match', '^macs ')
+            | list
+          }}
+
+    - name: Extract effective SSH cipher configuration
+      ansible.builtin.set_fact:
+        effective_ciphers: >-
+          {{
+            sshd_final_config.stdout_lines
+            | select('match', '^ciphers ')
+            | list
+          }}
+
+    - name: Display effective SSH MAC configuration
+      ansible.builtin.debug:
+        var: effective_macs
+
+    - name: Display effective SSH cipher configuration
+      ansible.builtin.debug:
+        var: effective_ciphers
+
+    - name: Verify CBC ciphers are disabled
+      ansible.builtin.assert:
+        that:
+          - "'3des-cbc' not in sshd_final_config.stdout"
+          - "'aes128-cbc' not in sshd_final_config.stdout"
+          - "'aes192-cbc' not in sshd_final_config.stdout"
+          - "'aes256-cbc' not in sshd_final_config.stdout"
+        fail_msg: "One or more CBC SSH ciphers are still enabled."
+
+    - name: Verify MD5 HMAC algorithms are disabled
+      ansible.builtin.assert:
+        that:
+          - "'hmac-md5' not in sshd_final_config.stdout"
+          - "'hmac-md5-96' not in sshd_final_config.stdout"
+        fail_msg: "MD5-based SSH MAC algorithms are still enabled."
+
+    - name: Verify 96-bit HMAC algorithms are disabled
+      ansible.builtin.assert:
+        that:
+          - "'hmac-sha1-96' not in sshd_final_config.stdout"
+          - "'hmac-md5-96' not in sshd_final_config.stdout"
+        fail_msg: "96-bit SSH MAC algorithms are still enabled."
+
+  handlers:
+
+    - name: Validate SSH configuration
+      ansible.builtin.command:
+        cmd: sshd -t
+      listen: Validate SSH configuration
+
+    - name: Restart SSH
+      ansible.builtin.systemd:
+        name: ssh
+        state: restarted
+        enabled: true
+      listen: Restart SSH
