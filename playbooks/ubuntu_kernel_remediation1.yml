@@ -1,0 +1,96 @@
+---
+- name: Automatic Ubuntu Kernel Remediation and Cleanup
+  hosts: all
+  become: true
+  gather_facts: true
+  serial: "{{ kernel_remediation_serial | default('100%') }}"
+  any_errors_fatal: false
+
+  vars:
+    # Automatically detect the Ubuntu kernel stream already installed.
+    # Supported examples:
+    #   Ubuntu 24.04 HWE -> linux-generic-hwe-24.04
+    #   Ubuntu 22.04 HWE -> linux-generic-hwe-22.04
+    #   Ubuntu generic   -> linux-generic
+    #
+    # Set to true to remove every installed kernel image except the
+    # currently running kernel after a successful reboot.
+    remove_all_old_kernels: true
+
+    # Reboot automatically after a new kernel is installed or when
+    # /var/run/reboot-required exists.
+    automatic_reboot: true
+
+    # Clean APT packages/cache after remediation.
+    automatic_cleanup: true
+
+    # Prevent accidental kernel-family switching if the existing stream
+    # cannot be identified.
+    refuse_unknown_kernel_track: true
+
+  pre_tasks:
+
+    # ================================================================
+    # OS validation
+    # ================================================================
+
+    - name: Verify supported Ubuntu release
+      ansible.builtin.assert:
+        that:
+          - ansible_facts.distribution == "Ubuntu"
+          - ansible_facts.distribution_major_version in ['20', '22', '24']
+        fail_msg: >-
+          Unsupported operating system or Ubuntu release:
+          {{ ansible_facts.distribution }} {{ ansible_facts.distribution_version }}
+
+    - name: Display current system information
+      ansible.builtin.debug:
+        msg:
+          - "Host: {{ inventory_hostname }}"
+          - "Ubuntu: {{ ansible_facts.distribution_version }}"
+          - "Architecture: {{ ansible_facts.architecture }}"
+          - "Current running kernel: {{ ansible_facts.kernel }}"
+
+    # ================================================================
+    # Detect installed kernel meta-packages
+    # ================================================================
+
+    - name: Find installed HWE kernel meta-packages
+      ansible.builtin.shell: |
+        dpkg-query -W -f='${Package}\t${Status}\n' 2>/dev/null |
+        awk '$1 ~ /^linux-generic-hwe-[0-9]+\.[0-9]+$/ &&
+             $2 == "install" && $3 == "ok" && $4 == "installed" {
+             print $1
+        }' |
+        sort -V |
+        tail -n 1
+      register: installed_hwe_meta
+      changed_when: false
+
+    - name: Check whether generic kernel meta-package is installed
+      ansible.builtin.shell: |
+        dpkg-query -W -f='${Status}' linux-generic 2>/dev/null |
+        grep -q '^install ok installed$'
+      register: generic_meta_check
+      changed_when: false
+      failed_when: false
+
+    - name: Select existing kernel track
+      ansible.builtin.set_fact:
+        kernel_meta_package: >-
+          {{
+            installed_hwe_meta.stdout | trim
+            if (installed_hwe_meta.stdout | trim | length > 0)
+            else 'linux-generic'
+            if generic_meta_check.rc == 0
+            else ''
+          }}
+
+    - name: Verify kernel track was detected
+      ansible.builtin.assert:
+        that:
+          - kernel_meta_package | length > 0
+        fail_msg: >-
+          Unable to determine the existing Ubuntu kernel track on
+          {{ inventory_hostname }}. No HWE or generic kernel meta-package
+          was detected. The playbook will not switch kernel families.
