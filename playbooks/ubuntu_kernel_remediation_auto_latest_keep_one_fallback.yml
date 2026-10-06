@@ -1,6 +1,6 @@
 ---
 - name: Automatic Ubuntu Kernel Remediation with One Fallback Kernel
-  hosts: ubuntu_servers
+  hosts: all
   become: true
   gather_facts: true
   serial: "{{ kernel_remediation_serial | default('100%') }}"
