@@ -1,0 +1,403 @@
+---
+# Ubuntu 24.04 patching and security-hardening playbook for Ansible AWX.
+#
+# Recommended AWX settings:
+#   - Inventory: your Ubuntu 24.04 hosts
+#   - Privilege escalation: enabled (become)
+#   - Check mode first on a test group
+#   - Take VM snapshots/backups and ensure out-of-band console access
+#
+# Behavior:
+#   - Audits each host independently.
+#   - If packages, kernel retention, web TLS policy, and SSH policy are already
+#     compliant, reports SKIPPED and performs no remediation on that host.
+#   - Otherwise remediates that host and validates the resulting configuration.
+#
+# TLS note: this configures Nginx/Apache only when installed. It retains TLS 1.2
+# alongside TLS 1.3 for compatibility. Set tls_protocols to "TLSv1.3" only if
+# every application/client has been tested and TLS 1.2 is intentionally forbidden.
+
+- name: Patch Ubuntu and harden kernel, TLS, and SSH
+  hosts: all
+  become: true
+  gather_facts: true
+  serial: 1
+  any_errors_fatal: false
+  max_fail_percentage: 100
+
+  vars:
+    supported_os: "Ubuntu"
+    supported_release: "24.04"
+
+    # Change to ["TLSv1.3"] only after compatibility testing.
+    tls_protocols: "TLSv1.2 TLSv1.3"
+
+    # Preserve Ubuntu's generic/HWE metapackages so future kernel updates arrive.
+    kernel_metapackages:
+      - linux-image-generic
+      - linux-image-generic-hwe-24.04
+
+    # Modern algorithms supported by current Ubuntu OpenSSH builds.
+    # Validate client compatibility before enforcing on production hosts.
+    sshd_hardening_block: |
+      # Managed by Ansible: modern SSH cryptography
+      KexAlgorithms sntrup761x25519-sha512@openssh.com,curve25519-sha256,curve25519-sha256@libssh.org,diffie-hellman-group16-sha512
+      Ciphers chacha20-poly1305@openssh.com,aes256-gcm@openssh.com,aes128-gcm@openssh.com
+      MACs hmac-sha2-512-etm@openssh.com,hmac-sha2-256-etm@openssh.com
+      HostKeyAlgorithms ssh-ed25519,rsa-sha2-512,rsa-sha2-256
+      PubkeyAcceptedAlgorithms ssh-ed25519,rsa-sha2-512,rsa-sha2-256
+
+  pre_tasks:
+    - name: Skip unsupported operating systems/releases
+      ansible.builtin.meta: end_host
+      when: >-
+        not (ansible_facts.distribution == supported_os and
+        ansible_facts.distribution_version is version(supported_release, '=='))
+
+    - name: Check for package updates
+      ansible.builtin.shell: |
+        set -o pipefail
+        apt-get -s upgrade 2>/dev/null | awk '/^Inst / {print}'
+      args:
+        executable: /bin/bash
+      register: patch_audit
+      changed_when: false
+      failed_when: false
+
+    - name: Discover installed kernel image packages
+      ansible.builtin.shell: |
+        dpkg-query -W -f='${binary:Package}\n' 'linux-image-[0-9]*-generic' 2>/dev/null \
+          | sed 's/:.*//' | sort -Vu
+      args:
+        executable: /bin/bash
+      register: kernel_packages_audit
+      changed_when: false
+      failed_when: false
+
+    - name: Check for Nginx
+      ansible.builtin.command: dpkg-query -W -f=${Status} nginx
+      register: nginx_installed_audit
+      changed_when: false
+      failed_when: false
+
+    - name: Check for Apache
+      ansible.builtin.command: dpkg-query -W -f=${Status} apache2
+      register: apache_installed_audit
+      changed_when: false
+      failed_when: false
+
+    - name: Read effective SSH daemon configuration
+      ansible.builtin.command: sshd -T
+      register: ssh_effective_audit
+      changed_when: false
+      failed_when: false
+
+    - name: Read Nginx TLS protocol configuration
+      ansible.builtin.shell: |
+        nginx -T 2>&1 | awk '/ssl_protocols/ {print}' || true
+      args:
+        executable: /bin/bash
+      register: nginx_tls_audit
+      changed_when: false
+      failed_when: false
+      when: nginx_installed_audit.rc == 0 and 'install ok installed' in nginx_installed_audit.stdout
+
+    - name: Read Apache TLS protocol configuration
+      ansible.builtin.shell: |
+        grep -RhsE '^[[:space:]]*SSLProtocol' /etc/apache2 2>/dev/null || true
+      args:
+        executable: /bin/bash
+      register: apache_tls_audit
+      changed_when: false
+      failed_when: false
+      when: apache_installed_audit.rc == 0 and 'install ok installed' in apache_installed_audit.stdout
+
+    - name: Determine if SSH algorithms are compliant
+      ansible.builtin.set_fact:
+        ssh_policy_compliant: >-
+          {{
+            ssh_effective_audit.rc == 0 and
+            ('sntrup761x25519-sha512@openssh.com' in ssh_effective_audit.stdout or
+             'curve25519-sha256' in ssh_effective_audit.stdout) and
+            'chacha20-poly1305@openssh.com' in ssh_effective_audit.stdout and
+            'hmac-sha2-512-etm@openssh.com' in ssh_effective_audit.stdout
+          }}
+
+    - name: Determine if web TLS policy is compliant
+      ansible.builtin.set_fact:
+        tls_policy_compliant: >-
+          {{
+            (
+              (nginx_installed_audit.rc != 0 or
+               'install ok installed' not in nginx_installed_audit.stdout or
+               (nginx_tls_audit is defined and
+                'TLSv1.3' in nginx_tls_audit.stdout and
+                'TLSv1.1' not in nginx_tls_audit.stdout and
+                'TLSv1 ' not in nginx_tls_audit.stdout))
+              and
+              (apache_installed_audit.rc != 0 or
+               'install ok installed' not in apache_installed_audit.stdout or
+               (apache_tls_audit is defined and
+                'TLSv1.3' in apache_tls_audit.stdout and
+                'TLSv1.1' not in apache_tls_audit.stdout and
+                'TLSv1 ' not in apache_tls_audit.stdout))
+            )
+          }}
+
+    - name: Determine kernel package count and patch state
+      ansible.builtin.set_fact:
+        installed_kernel_count: "{{ kernel_packages_audit.stdout_lines | default([]) | length }}"
+        packages_compliant: "{{ (patch_audit.stdout | default('') | trim) == '' }}"
+        kernel_set_compliant: "{{ (kernel_packages_audit.stdout_lines | default([]) | length) <= 2 }}"
+
+    - name: Skip host if all requested settings are already compliant
+      ansible.builtin.debug:
+        msg: >-
+          SKIPPED {{ inventory_hostname }}: package updates, kernel retention,
+          TLS policy, and SSH algorithm checks appear compliant.
+      when:
+        - packages_compliant | bool
+        - kernel_set_compliant | bool
+        - tls_policy_compliant | bool
+        - ssh_policy_compliant | bool
+
+    - name: End host when all requested settings are compliant
+      ansible.builtin.meta: end_host
+      when:
+        - packages_compliant | bool
+        - kernel_set_compliant | bool
+        - tls_policy_compliant | bool
+        - ssh_policy_compliant | bool
+
+  tasks:
+    - name: Refresh APT cache
+      ansible.builtin.apt:
+        update_cache: true
+        cache_valid_time: 3600
+
+    - name: Apply all available package updates
+      ansible.builtin.apt:
+        upgrade: dist
+        update_cache: true
+        autoremove: false
+        autoclean: true
+      environment:
+        DEBIAN_FRONTEND: noninteractive
+
+    - name: Ensure kernel metapackages are installed when available
+      ansible.builtin.apt:
+        name: "{{ kernel_metapackages }}"
+        state: present
+      register: kernel_meta_result
+      failed_when: false
+
+    - name: Refresh installed kernel package list after updates
+      ansible.builtin.shell: |
+        dpkg-query -W -f='${binary:Package}\n' 'linux-image-[0-9]*-generic' 2>/dev/null \
+          | sed 's/:.*//' | sort -Vu
+      args:
+        executable: /bin/bash
+      register: kernel_packages_after_update
+      changed_when: false
+      failed_when: false
+
+    - name: Get running kernel release
+      ansible.builtin.command: uname -r
+      register: running_kernel
+      changed_when: false
+
+    - name: Get version-sorted installed kernel image packages
+      ansible.builtin.shell: |
+        for p in $(dpkg-query -W -f='${binary:Package}\n' 'linux-image-[0-9]*-generic' 2>/dev/null | sed 's/:.*//'); do
+          v="${p#linux-image-}"
+          printf '%s\t%s\n' "$v" "$p"
+        done | sort -V
+      args:
+        executable: /bin/bash
+      register: version_sorted_kernels
+      changed_when: false
+      failed_when: false
+
+    - name: Build latest and fallback kernel retention list
+      ansible.builtin.set_fact:
+        keep_kernel_packages: "{{ (version_sorted_kernels.stdout_lines | default([]) | map('regex_replace', '^.*\\t', '') | list)[-2:] }}"
+      when: (version_sorted_kernels.stdout_lines | default([]) | length) > 0
+
+    - name: Ensure the currently running kernel is not removed before reboot
+      ansible.builtin.set_fact:
+        keep_kernel_packages: "{{ (keep_kernel_packages | default([])) + (version_sorted_kernels.stdout_lines | default([]) | select('search', running_kernel.stdout) | map('regex_replace', '^.*\\t', '') | list) | unique }}"
+      when:
+        - keep_kernel_packages is defined
+        - running_kernel.stdout not in (keep_kernel_packages | join(' '))
+
+    - name: Remove older kernel image packages while retaining latest, fallback, and running kernel
+      ansible.builtin.apt:
+        name: "{{ item }}"
+        state: absent
+        purge: true
+      loop: "{{ (version_sorted_kernels.stdout_lines | default([]) | map('regex_replace', '^.*\\t', '') | list) | difference(keep_kernel_packages | default([])) }}"
+      when:
+        - version_sorted_kernels.stdout_lines is defined
+        - version_sorted_kernels.stdout_lines | length > 2
+      register: old_kernel_removal
+      # The currently running kernel is retained until a successful reboot.
+      # If it is older than the newest two, it is temporarily retained as an
+      # additional safety kernel rather than removed while active.
+
+    - name: Ensure SSH hardening drop-in directory exists
+      ansible.builtin.file:
+        path: /etc/ssh/sshd_config.d
+        state: directory
+        owner: root
+        group: root
+        mode: "0755"
+
+    - name: Back up main SSH configuration before hardening
+      ansible.builtin.copy:
+        src: /etc/ssh/sshd_config
+        dest: "/etc/ssh/sshd_config.ansible-backup-{{ ansible_date_time.iso8601_basic_short }}"
+        remote_src: true
+        owner: root
+        group: root
+        mode: "0600"
+        force: false
+
+    - name: Install modern SSH algorithm policy
+      ansible.builtin.copy:
+        dest: /etc/ssh/sshd_config.d/00-ansible-crypto-hardening.conf
+        content: "{{ sshd_hardening_block }}\n"
+        owner: root
+        group: root
+        mode: "0600"
+        validate: "/usr/sbin/sshd -t -f %s"
+      notify: Validate and reload SSH
+
+    - name: Ensure Nginx TLS protocols are hardened
+      when: nginx_installed_audit.rc == 0 and 'install ok installed' in nginx_installed_audit.stdout
+      block:
+        - name: Back up Nginx configuration tree
+          ansible.builtin.command: >
+            tar -czf /root/nginx-config-backup-{{ ansible_date_time.iso8601_basic_short }}.tar.gz
+            -C / etc/nginx
+          args:
+            creates: "/root/nginx-config-backup-{{ ansible_date_time.iso8601_basic_short }}.tar.gz"
+          changed_when: true
+
+        - name: Set TLS protocols in Nginx http context
+          ansible.builtin.copy:
+            dest: /etc/nginx/conf.d/00-ansible-tls-hardening.conf
+            content: |
+              # Managed by Ansible. TLS 1.2 is retained for compatibility; TLS 1.3 is enabled.
+              ssl_protocols {{ tls_protocols }};
+            owner: root
+            group: root
+            mode: "0644"
+          notify: Validate and reload Nginx
+
+    - name: Ensure Apache TLS protocols are hardened
+      when: apache_installed_audit.rc == 0 and 'install ok installed' in apache_installed_audit.stdout
+      block:
+        - name: Back up Apache configuration tree
+          ansible.builtin.command: >
+            tar -czf /root/apache-config-backup-{{ ansible_date_time.iso8601_basic_short }}.tar.gz
+            -C / etc/apache2
+          args:
+            creates: "/root/apache-config-backup-{{ ansible_date_time.iso8601_basic_short }}.tar.gz"
+          changed_when: true
+
+        - name: Enable Apache SSL module
+          ansible.builtin.command: a2enmod ssl
+          register: apache_ssl_enable
+          changed_when: "'Enabling module ssl' in apache_ssl_enable.stdout"
+          failed_when: false
+
+        - name: Configure Apache TLS protocol policy
+          ansible.builtin.copy:
+            dest: /etc/apache2/conf-available/ansible-tls-hardening.conf
+            content: |
+              # Managed by Ansible. TLS 1.2 is retained for compatibility; TLS 1.3 is enabled.
+              SSLProtocol {{ tls_protocols | replace('TLSv1.2', 'TLSv1.2') }}
+            owner: root
+            group: root
+            mode: "0644"
+          notify: Validate and reload Apache
+
+        - name: Enable Apache TLS policy
+          ansible.builtin.command: a2enconf ansible-tls-hardening
+          register: apache_tls_enable
+          changed_when: "'Enabling conf ansible-tls-hardening' in apache_tls_enable.stdout"
+          failed_when: false
+          notify: Validate and reload Apache
+
+    - name: Validate effective SSH configuration after hardening
+      ansible.builtin.command: sshd -T
+      register: ssh_effective_after
+      changed_when: false
+      failed_when: >-
+        ssh_effective_after.rc != 0 or
+        'chacha20-poly1305@openssh.com' not in ssh_effective_after.stdout or
+        'hmac-sha2-512-etm@openssh.com' not in ssh_effective_after.stdout
+
+    - name: Validate Nginx configuration and TLS policy
+      ansible.builtin.shell: |
+        set -e
+        nginx -t
+        nginx -T 2>&1 | grep -E 'ssl_protocols.*TLSv1\.3'
+      args:
+        executable: /bin/bash
+      register: nginx_validate_after
+      changed_when: false
+      when: nginx_installed_audit.rc == 0 and 'install ok installed' in nginx_installed_audit.stdout
+
+    - name: Validate Apache configuration and TLS policy
+      ansible.builtin.shell: |
+        set -e
+        apache2ctl configtest
+        grep -RhsE '^[[:space:]]*SSLProtocol.*TLSv1\.3' /etc/apache2/conf-enabled
+      args:
+        executable: /bin/bash
+      register: apache_validate_after
+      changed_when: false
+      when: apache_installed_audit.rc == 0 and 'install ok installed' in apache_installed_audit.stdout
+
+    - name: Report host remediation summary
+      ansible.builtin.debug:
+        msg:
+          - "Host: {{ inventory_hostname }}"
+          - "Package updates applied where available."
+          - "Kernel retention target: latest kernel + fallback; running kernel is retained until reboot if needed."
+          - "TLS policy: {{ tls_protocols }} for installed Nginx/Apache."
+          - "SSH algorithm policy installed and sshd -T validation passed."
+          - "Reboot may be required to activate a newly installed kernel."
+
+  handlers:
+    - name: Validate and reload SSH
+      ansible.builtin.shell: |
+        set -e
+        /usr/sbin/sshd -t
+        if systemctl is-active --quiet ssh; then
+          systemctl reload ssh
+        elif systemctl is-active --quiet sshd; then
+          systemctl reload sshd
+        fi
+      args:
+        executable: /bin/bash
+      listen: Validate and reload SSH
+
+    - name: Validate and reload Nginx
+      ansible.builtin.shell: |
+        set -e
+        nginx -t
+        systemctl reload nginx
+      args:
+        executable: /bin/bash
+      listen: Validate and reload Nginx
+
+    - name: Validate and reload Apache
+      ansible.builtin.shell: |
+        set -e
+        apache2ctl configtest
+        systemctl reload apache2
+      args:
+        executable: /bin/bash
+      listen: Validate and reload Apache
